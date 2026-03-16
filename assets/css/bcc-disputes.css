@@ -1,0 +1,346 @@
+/* ================================================================
+   BCC Disputes — shared styles
+   ================================================================ */
+
+/* ── Shared ── */
+.bcc-dispute-form,
+.bcc-dispute-queue {
+    --clr-surface:  var(--BCC--SURFACE,  #1a1d24);
+    --clr-border:   var(--BCC--BORDER,   rgba(255,255,255,0.10));
+    --clr-text:     var(--BCC--TEXT,     #e4e7ef);
+    --clr-muted:    var(--BCC--TEXT--MUTED, #6b7280);
+    --clr-trust:    var(--BCC--TRUST,    #3b82f6);
+    --clr-danger:   var(--BCC--DANGER,   #ef4444);
+    --clr-warning:  var(--BCC--WARNING,  #f59e0b);
+    --clr-success:  #22c55e;
+
+    background: var(--clr-surface);
+    border: 1.5px solid var(--clr-border);
+    border-radius: 16px;
+    padding: 24px;
+    color: var(--clr-text);
+    font-size: 0.9rem;
+}
+
+.bcc-dispute-loading {
+    color: var(--clr-muted);
+    padding: 12px 0;
+    font-size: 0.875rem;
+}
+
+/* ── Headings ── */
+.bcc-dispute-form__title,
+.bcc-dispute-queue__title,
+.bcc-dispute-history__heading,
+.bcc-dispute-submit-panel__heading {
+    margin: 0 0 6px;
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--clr-text);
+}
+
+.bcc-dispute-form__sub,
+.bcc-dispute-queue__sub {
+    margin: 0 0 20px;
+    font-size: 0.82rem;
+    color: var(--clr-muted);
+}
+
+/* ── Vote list (owner form) ── */
+.bcc-dispute-vote-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--clr-border);
+}
+.bcc-dispute-vote-item:last-child { border-bottom: none; }
+
+.bcc-dispute-vote-meta {
+    flex: 1;
+    min-width: 0;
+}
+.bcc-dispute-vote-name {
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+.bcc-dispute-vote-type {
+    font-size: 0.78rem;
+    color: var(--clr-muted);
+    margin-top: 2px;
+}
+.bcc-dispute-vote-type--up   { color: var(--clr-success); }
+.bcc-dispute-vote-type--down { color: var(--clr-danger);  }
+
+/* ── Buttons ── */
+.bcc-dispute-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: none;
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s, background 0.15s;
+}
+.bcc-dispute-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.bcc-dispute-btn--primary   { background: var(--clr-trust);  color: #fff; }
+.bcc-dispute-btn--secondary { background: rgba(255,255,255,0.07); color: var(--clr-text); }
+.bcc-dispute-btn--danger    { background: var(--clr-danger); color: #fff; }
+.bcc-dispute-btn--success   { background: var(--clr-success); color: #fff; }
+.bcc-dispute-btn--sm { padding: 5px 12px; font-size: 0.78rem; }
+
+/* ── Submit panel ── */
+.bcc-dispute-submit-panel {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--clr-border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-top: 16px;
+}
+.bcc-dispute-submit-panel__voter {
+    font-size: 0.82rem;
+    color: var(--clr-muted);
+    margin: 0 0 14px;
+}
+.bcc-dispute-label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--clr-muted);
+    margin-bottom: 14px;
+}
+.bcc-dispute-required { color: var(--clr-danger); }
+.bcc-dispute-reason,
+.bcc-dispute-evidence {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--clr-border);
+    border-radius: 8px;
+    color: var(--clr-text);
+    font-size: 0.875rem;
+    padding: 10px 12px;
+    width: 100%;
+    resize: vertical;
+    box-sizing: border-box;
+}
+.bcc-dispute-reason:focus,
+.bcc-dispute-evidence:focus {
+    outline: none;
+    border-color: var(--clr-trust);
+    box-shadow: 0 0 0 3px rgba(59,130,246,0.15);
+}
+.bcc-dispute-submit-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 4px;
+}
+.bcc-dispute-status {
+    font-size: 0.8rem;
+    margin-top: 8px;
+    min-height: 1em;
+}
+.bcc-dispute-status--ok  { color: var(--clr-success); }
+.bcc-dispute-status--err { color: var(--clr-danger);  }
+
+/* ── History (owner) ── */
+.bcc-dispute-history {
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--clr-border);
+}
+
+/* ── Dispute card (queue + history) ── */
+.bcc-dispute-card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--clr-border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 12px;
+}
+.bcc-dispute-card__meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+.bcc-dispute-card__page  { font-weight: 700; font-size: 0.9rem; }
+.bcc-dispute-card__voter { font-size: 0.8rem; color: var(--clr-muted); }
+.bcc-dispute-card__date  { font-size: 0.78rem; color: var(--clr-muted); margin-left: auto; }
+
+.bcc-dispute-card__reason {
+    font-size: 0.83rem;
+    color: var(--clr-text);
+    margin: 8px 0;
+    background: rgba(255,255,255,0.03);
+    border-left: 3px solid var(--clr-trust);
+    padding: 8px 12px;
+    border-radius: 0 6px 6px 0;
+}
+.bcc-dispute-card__evidence {
+    font-size: 0.78rem;
+    color: var(--clr-trust);
+    text-decoration: none;
+    display: inline-block;
+    margin-bottom: 10px;
+}
+.bcc-dispute-card__tally {
+    font-size: 0.8rem;
+    color: var(--clr-muted);
+    margin-bottom: 10px;
+}
+
+/* ── Status badge ── */
+.bcc-dispute-badge {
+    display: inline-block;
+    border-radius: 20px;
+    padding: 2px 9px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+}
+.bcc-dispute-badge--pending   { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.bcc-dispute-badge--reviewing { background: rgba(59,130,246,0.15); color: #3b82f6; }
+.bcc-dispute-badge--accepted  { background: rgba(34,197,94,0.15);  color: #22c55e; }
+.bcc-dispute-badge--rejected  { background: rgba(239,68,68,0.15);  color: #ef4444; }
+
+/* ── Panel vote actions ── */
+.bcc-dispute-panel-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+.bcc-dispute-already-voted {
+    font-size: 0.82rem;
+    color: var(--clr-muted);
+    font-style: italic;
+}
+
+/* ── No items ── */
+.bcc-dispute-empty {
+    text-align: center;
+    color: var(--clr-muted);
+    padding: 20px;
+    font-size: 0.875rem;
+}
+
+/* ================================================================
+   Report User — trigger button
+   ================================================================ */
+.bcc-report-user-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: 1.5px solid rgba(239,68,68,0.4);
+    color: #ef4444;
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+.bcc-report-user-btn:hover {
+    background: rgba(239,68,68,0.08);
+    border-color: #ef4444;
+}
+
+/* ================================================================
+   Report User — modal
+   ================================================================ */
+.bcc-report-modal {
+    --modal-bg:      #1a1d24;
+    --modal-border:  rgba(255,255,255,0.12);
+    --modal-text:    #e4e7ef;
+    --modal-muted:   #6b7280;
+    --modal-danger:  #ef4444;
+    --modal-trust:   #3b82f6;
+    --modal-success: #22c55e;
+}
+
+.bcc-report-modal[hidden] { display: none; }
+
+.bcc-report-modal__backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    backdrop-filter: blur(3px);
+    z-index: 9998;
+}
+
+.bcc-report-modal__dialog {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 9999;
+    background: var(--modal-bg);
+    border: 1.5px solid var(--modal-border);
+    border-radius: 16px;
+    padding: 28px 28px 24px;
+    width: min(480px, calc(100vw - 32px));
+    color: var(--modal-text);
+    font-size: 0.9rem;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+}
+
+.bcc-report-modal__close {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    background: transparent;
+    border: none;
+    color: var(--modal-muted);
+    font-size: 1rem;
+    cursor: pointer;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 6px;
+    transition: color 0.15s, background 0.15s;
+}
+.bcc-report-modal__close:hover {
+    color: var(--modal-text);
+    background: rgba(255,255,255,0.08);
+}
+
+.bcc-report-modal__title {
+    margin: 0 0 4px;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--modal-text);
+}
+
+.bcc-report-modal__sub {
+    margin: 0 0 20px;
+    font-size: 0.82rem;
+    color: var(--modal-muted);
+}
+
+.bcc-report-modal__optional {
+    font-weight: 400;
+    color: var(--modal-muted);
+}
+
+.bcc-report-select {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--modal-border);
+    border-radius: 8px;
+    color: var(--modal-text);
+    font-size: 0.875rem;
+    padding: 9px 12px;
+    width: 100%;
+    box-sizing: border-box;
+    cursor: pointer;
+    appearance: auto;
+}
+.bcc-report-select:focus {
+    outline: none;
+    border-color: var(--modal-trust);
+    box-shadow: 0 0 0 3px rgba(59,130,246,0.15);
+}
