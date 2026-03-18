@@ -1,0 +1,14 @@
+{
+    "name": "bcc/disputes",
+    "description": "Community dispute system for BCC trust votes.",
+    "type": "wordpress-plugin",
+    "license": "proprietary",
+    "autoload": {
+        "psr-4": {
+            "BCC\\Disputes\\": "app/"
+        }
+    },
+    "require": {
+        "php": ">=7.4"
+    }
+}

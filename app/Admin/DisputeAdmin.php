@@ -1,10 +1,15 @@
 <?php
 
+namespace BCC\Disputes\Admin;
+
+use BCC\Disputes\Plugin;
+use BCC\Disputes\Repositories\DisputeRepository;
+
 if (!defined('ABSPATH')) {
     exit;
 }
 
-class BCC_Disputes_Admin
+class DisputeAdmin
 {
     public static function boot(): void
     {
@@ -55,9 +60,7 @@ class BCC_Disputes_Admin
 
     private static function render_list(): void
     {
-        require_once BCC_DISPUTES_PATH . 'includes/admin/class-bcc-disputes-list-table.php';
-
-        $table = new BCC_Disputes_List_Table();
+        $table = new DisputeListTable();
         $table->prepare_items();
 
         echo '<div class="wrap">';
@@ -79,8 +82,8 @@ class BCC_Disputes_Admin
     {
         global $wpdb;
 
-        $dt = BCC_Disputes_DB::disputes_table();
-        $pt = BCC_Disputes_DB::panel_table();
+        $disputeTable = DisputeRepository::disputes_table();
+        $panelTable   = DisputeRepository::panel_table();
 
         $votes_table = function_exists('bcc_trust_votes_table')
             ? bcc_trust_votes_table()
@@ -93,7 +96,7 @@ class BCC_Disputes_Admin
                     reporter.display_name AS reporter_name,
                     voter.display_name    AS voter_name,
                     v.vote_type, v.weight, v.reason AS vote_reason, v.created_at AS vote_date
-             FROM {$dt} d
+             FROM {$disputeTable} d
              LEFT JOIN {$wpdb->posts} p         ON d.page_id     = p.ID
              LEFT JOIN {$wpdb->users} reporter   ON d.reporter_id = reporter.ID
              LEFT JOIN {$wpdb->users} voter      ON d.voter_id    = voter.ID
@@ -111,7 +114,7 @@ class BCC_Disputes_Admin
         // Panel votes.
         $panelists = $wpdb->get_results($wpdb->prepare(
             "SELECT pan.*, u.display_name
-             FROM {$pt} pan
+             FROM {$panelTable} pan
              LEFT JOIN {$wpdb->users} u ON pan.panelist_user_id = u.ID
              WHERE pan.dispute_id = %d
              ORDER BY pan.assigned_at ASC",
@@ -294,14 +297,19 @@ class BCC_Disputes_Admin
         }
 
         global $wpdb;
-        $dt      = BCC_Disputes_DB::disputes_table();
-        $dispute = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$dt} WHERE id = %d LIMIT 1", $dispute_id));
+        $disputeTable = DisputeRepository::disputes_table();
+        $dispute      = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1", $dispute_id));
 
         if (!$dispute) {
             return;
         }
 
-        $api = new BCC_Disputes_API();
+        // Prevent re-resolving already-resolved disputes
+        if (!in_array($dispute->status, ['pending', 'reviewing'], true)) {
+            return;
+        }
+
+        $api = Plugin::instance()->controller();
 
         if ($action === 'accepted' || $action === 'rejected') {
             $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $action);
@@ -347,9 +355,7 @@ class BCC_Disputes_Admin
             return;
         }
 
-        require_once BCC_DISPUTES_PATH . 'includes/admin/class-bcc-reports-list-table.php';
-
-        $table = new BCC_Reports_List_Table();
+        $table = new ReportListTable();
         $table->prepare_items();
 
         echo '<div class="wrap">';
@@ -391,21 +397,36 @@ class BCC_Disputes_Admin
             return;
         }
 
+        // Nonce check must happen before any DB operations
         check_admin_referer('bcc_report_action_' . $report_id);
 
+        // Verify the report exists before updating
         global $wpdb;
-        $rt = BCC_Disputes_DB::user_reports_table();
+        $reportTable = DisputeRepository::user_reports_table();
+        $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$reportTable} WHERE id = %d LIMIT 1", $report_id));
+        if (!$exists) {
+            return;
+        }
 
-        $wpdb->update(
-            $rt,
+        $update_result = $wpdb->update(
+            $reportTable,
             ['status' => $action, 'reviewed_at' => current_time('mysql')],
             ['id' => $report_id],
             ['%s', '%s'],
             ['%d']
         );
 
-        if ($wpdb->last_error) {
-            error_log('BCC Disputes DB error (report action): ' . $wpdb->last_error);
+        if ($update_result === false) {
+            if (class_exists('BCC\\Core\\Log\\Logger')) {
+                \BCC\Core\Log\Logger::error('[Disputes] report_action_failed', [
+                    'report_id' => $report_id,
+                    'action'    => $action,
+                    'db_error'  => $wpdb->last_error,
+                ]);
+            } else {
+                error_log('[BCC Disputes] report_action_failed report_id=' . $report_id . ' error=' . $wpdb->last_error);
+            }
+            wp_die(__('Failed to update report.', 'bcc-disputes'));
         }
 
         wp_safe_redirect(add_query_arg(

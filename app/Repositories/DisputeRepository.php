@@ -1,10 +1,12 @@
 <?php
 
+namespace BCC\Disputes\Repositories;
+
 if (!defined('ABSPATH')) {
     exit;
 }
 
-class BCC_Disputes_DB
+class DisputeRepository
 {
     public static function disputes_table(): string
     {

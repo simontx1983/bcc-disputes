@@ -1,5 +1,10 @@
 <?php
 
+namespace BCC\Disputes\Admin;
+
+use BCC\Disputes\Repositories\DisputeRepository;
+use WP_List_Table;
+
 if (!defined('ABSPATH')) {
     exit;
 }
@@ -8,7 +13,7 @@ if (!class_exists('WP_List_Table')) {
     require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
 }
 
-class BCC_Reports_List_Table extends WP_List_Table
+class ReportListTable extends WP_List_Table
 {
     public function __construct()
     {
@@ -48,10 +53,10 @@ class BCC_Reports_List_Table extends WP_List_Table
         $base    = admin_url('admin.php?page=bcc-reports');
 
         global $wpdb;
-        $rt = BCC_Disputes_DB::user_reports_table();
+        $reportTable = DisputeRepository::user_reports_table();
 
         $counts = [];
-        $rows   = $wpdb->get_results("SELECT status, COUNT(*) as cnt FROM {$rt} GROUP BY status");
+        $rows   = $wpdb->get_results("SELECT status, COUNT(*) as cnt FROM {$reportTable} GROUP BY status");
         $total  = 0;
         foreach ($rows as $r) {
             $counts[$r->status] = (int) $r->cnt;
@@ -85,7 +90,7 @@ class BCC_Reports_List_Table extends WP_List_Table
     {
         global $wpdb;
 
-        $rt = BCC_Disputes_DB::user_reports_table();
+        $reportTable = DisputeRepository::user_reports_table();
 
         // Filters
         $where  = '1=1';
@@ -105,7 +110,7 @@ class BCC_Reports_List_Table extends WP_List_Table
         $order = isset($_GET['order']) && strtoupper($_GET['order']) === 'ASC' ? 'ASC' : 'DESC';
 
         // Count
-        $count_sql = "SELECT COUNT(*) FROM {$rt} r WHERE {$where}";
+        $count_sql = "SELECT COUNT(*) FROM {$reportTable} r WHERE {$where}";
         $total     = $params
             ? (int) $wpdb->get_var($wpdb->prepare($count_sql, ...$params))
             : (int) $wpdb->get_var($count_sql);
@@ -125,7 +130,7 @@ class BCC_Reports_List_Table extends WP_List_Table
         $sql = "SELECT r.*,
                        reported.display_name AS reported_name,
                        reporter.display_name AS reporter_name
-                FROM {$rt} r
+                FROM {$reportTable} r
                 LEFT JOIN {$wpdb->users} reported ON r.reported_id = reported.ID
                 LEFT JOIN {$wpdb->users} reporter ON r.reporter_id = reporter.ID
                 WHERE {$where}

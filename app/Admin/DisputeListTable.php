@@ -1,5 +1,10 @@
 <?php
 
+namespace BCC\Disputes\Admin;
+
+use BCC\Disputes\Repositories\DisputeRepository;
+use WP_List_Table;
+
 if (!defined('ABSPATH')) {
     exit;
 }
@@ -8,7 +13,7 @@ if (!class_exists('WP_List_Table')) {
     require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
 }
 
-class BCC_Disputes_List_Table extends WP_List_Table
+class DisputeListTable extends WP_List_Table
 {
     public function __construct()
     {
@@ -49,10 +54,10 @@ class BCC_Disputes_List_Table extends WP_List_Table
         $base    = admin_url('admin.php?page=bcc-disputes');
 
         global $wpdb;
-        $dt = BCC_Disputes_DB::disputes_table();
+        $disputeTable = DisputeRepository::disputes_table();
 
         $counts = [];
-        $rows   = $wpdb->get_results("SELECT status, COUNT(*) as cnt FROM {$dt} GROUP BY status");
+        $rows   = $wpdb->get_results("SELECT status, COUNT(*) as cnt FROM {$disputeTable} GROUP BY status");
         $total  = 0;
         foreach ($rows as $r) {
             $counts[$r->status] = (int) $r->cnt;
@@ -86,7 +91,7 @@ class BCC_Disputes_List_Table extends WP_List_Table
     {
         global $wpdb;
 
-        $dt          = BCC_Disputes_DB::disputes_table();
+        $disputeTable = DisputeRepository::disputes_table();
         $votes_table = function_exists('bcc_trust_votes_table')
             ? bcc_trust_votes_table()
             : $wpdb->prefix . 'bcc_trust_votes';
@@ -109,7 +114,7 @@ class BCC_Disputes_List_Table extends WP_List_Table
         $order = isset($_GET['order']) && strtoupper($_GET['order']) === 'ASC' ? 'ASC' : 'DESC';
 
         // Count
-        $count_sql = "SELECT COUNT(*) FROM {$dt} d WHERE {$where}";
+        $count_sql = "SELECT COUNT(*) FROM {$disputeTable} d WHERE {$where}";
         $total     = $params
             ? (int) $wpdb->get_var($wpdb->prepare($count_sql, ...$params))
             : (int) $wpdb->get_var($count_sql);
@@ -131,7 +136,7 @@ class BCC_Disputes_List_Table extends WP_List_Table
                        reporter.display_name AS reporter_name,
                        voter.display_name    AS voter_name,
                        v.vote_type
-                FROM {$dt} d
+                FROM {$disputeTable} d
                 LEFT JOIN {$wpdb->posts} p         ON d.page_id     = p.ID
                 LEFT JOIN {$wpdb->users} reporter   ON d.reporter_id = reporter.ID
                 LEFT JOIN {$wpdb->users} voter      ON d.voter_id    = voter.ID

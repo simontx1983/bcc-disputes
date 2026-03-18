@@ -2,47 +2,50 @@
 /**
  * Plugin Name: Blue Collar Crypto – Disputes
  * Description: Community dispute system for BCC trust votes. Page owners can challenge votes; Gold/Platinum panelists decide the outcome.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Blue Collar Labs LLC
  * Text Domain: bcc-disputes
  * Requires at least: 5.8
  * Requires PHP: 7.4
+ * Requires Plugins: bcc-core
  */
 
 if (!defined('ABSPATH')) {
     exit;
 }
 
-define('BCC_DISPUTES_VERSION', '1.0.0');
+define('BCC_DISPUTES_VERSION', '1.1.0');
 define('BCC_DISPUTES_PATH', plugin_dir_path(__FILE__));
 define('BCC_DISPUTES_URL', plugin_dir_url(__FILE__));
 define('BCC_DISPUTES_PANEL_SIZE', 5);     // panelists per dispute
 define('BCC_DISPUTES_TTL_DAYS', 7);       // auto-resolve after N days
-define('BCC_DISPUTES_MIN_TIER', 'gold');  // minimum tier to be a panelist
 
-require_once BCC_DISPUTES_PATH . 'includes/class-bcc-disputes-db.php';
-require_once BCC_DISPUTES_PATH . 'includes/class-bcc-disputes-api.php';
-require_once BCC_DISPUTES_PATH . 'includes/class-bcc-disputes-cron.php';
+$bcc_disputes_autoloader = BCC_DISPUTES_PATH . 'vendor/autoload.php';
+if (file_exists($bcc_disputes_autoloader)) {
+    require_once $bcc_disputes_autoloader;
+}
 
 if (is_admin()) {
-    require_once BCC_DISPUTES_PATH . 'includes/admin/class-bcc-disputes-admin.php';
-    BCC_Disputes_Admin::boot();
+    \BCC\Disputes\Admin\DisputeAdmin::boot();
 }
 
 // ── Activation: install tables + schedule cron ───────────────────────────────
 register_activation_hook(__FILE__, function () {
-    BCC_Disputes_DB::install();
-    BCC_Disputes_Cron::schedule();
+    \BCC\Disputes\Repositories\DisputeRepository::install();
+    \BCC\Disputes\Services\DisputeScheduler::schedule();
 });
 
 register_deactivation_hook(__FILE__, function () {
-    BCC_Disputes_Cron::unschedule();
+    \BCC\Disputes\Services\DisputeScheduler::unschedule();
+});
+
+add_action('init', function () {
+    \BCC\Disputes\Services\DisputeScheduler::boot();
 });
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 add_action('rest_api_init', function () {
-    $api = new BCC_Disputes_API();
-    $api->register_routes();
+    \BCC\Disputes\Plugin::instance()->controller()->register_routes();
 });
 
 add_action('wp_enqueue_scripts', function () {

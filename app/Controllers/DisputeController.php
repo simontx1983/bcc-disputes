@@ -1,10 +1,23 @@
 <?php
 
+namespace BCC\Disputes\Controllers;
+
+use BCC\Core\Contracts\TrustReadServiceInterface;
+use BCC\Core\ServiceLocator;
+use BCC\Disputes\Application\Disputes\ResolveDisputeCommand;
+use BCC\Disputes\Plugin;
+use BCC\Disputes\Repositories\DisputeRepository;
+use BCC\Disputes\Support\Logger;
+use WP_REST_Request;
+use WP_REST_Response;
+use WP_REST_Server;
+use WP_User;
+
 if (!defined('ABSPATH')) {
     exit;
 }
 
-class BCC_Disputes_API
+class DisputeController
 {
     const NS = 'bcc/v1';
 
@@ -95,7 +108,7 @@ class BCC_Disputes_API
         $evidence_url    = $req->get_param('evidence_url') ?? '';
 
         // Verify vote exists
-        $vote = $this->get_vote($vote_id);
+        $vote = $this->getVote($vote_id);
         if (!$vote) {
             return $this->error('vote_not_found', 'Vote not found.', 404);
         }
@@ -104,7 +117,7 @@ class BCC_Disputes_API
         $voter_id = (int) $vote->voter_user_id;
 
         // Only page owner can dispute
-        if (!$this->is_page_owner($page_id, $current_user_id)) {
+        if (!$this->isPageOwner($page_id, $current_user_id)) {
             return $this->error('not_page_owner', 'Only the page owner can dispute votes.', 403);
         }
 
@@ -113,12 +126,12 @@ class BCC_Disputes_API
             return $this->error('cannot_self_dispute', 'You cannot dispute your own vote.', 400);
         }
 
-        $dt = BCC_Disputes_DB::disputes_table();
-        $pt = BCC_Disputes_DB::panel_table();
+        $disputeTable = DisputeRepository::disputes_table();
+        $panelTable   = DisputeRepository::panel_table();
 
         // One active dispute per vote
         $existing = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$dt} WHERE vote_id = %d AND status IN ('pending','reviewing') LIMIT 1",
+            "SELECT id FROM {$disputeTable} WHERE vote_id = %d AND status IN ('pending','reviewing') LIMIT 1",
             $vote_id
         ));
         if ($existing) {
@@ -126,7 +139,7 @@ class BCC_Disputes_API
         }
 
         // Insert dispute
-        $wpdb->insert($dt, [
+        $wpdb->insert($disputeTable, [
             'vote_id'      => $vote_id,
             'page_id'      => $page_id,
             'reporter_id'  => $current_user_id,
@@ -144,19 +157,23 @@ class BCC_Disputes_API
         }
 
         // Assign panelists
-        $panelists = $this->select_panelists($current_user_id, $voter_id);
+        $panelists = $this->selectPanelists($current_user_id, $voter_id);
 
         foreach ($panelists as $uid) {
-            $wpdb->insert($pt, [
+            $wpdb->insert($panelTable, [
                 'dispute_id'       => $dispute_id,
                 'panelist_user_id' => $uid,
             ], ['%d', '%d']);
 
             if ($wpdb->last_error) {
-                error_log('BCC Disputes DB error (panel insert): ' . $wpdb->last_error);
+                Logger::logFailure('panel_insert_failed', [
+                    'dispute_id'  => $dispute_id,
+                    'panelist_id' => $uid,
+                    'db_error'    => $wpdb->last_error,
+                ]);
             }
 
-            $this->notify_panelist($uid, $dispute_id, $page_id);
+            $this->notifyPanelist($uid, $dispute_id, $page_id);
         }
 
         return rest_ensure_response([
@@ -172,40 +189,52 @@ class BCC_Disputes_API
     {
         global $wpdb;
 
+
         $page_id         = (int) $req->get_param('page_id');
         $current_user_id = get_current_user_id();
 
-        if (!$this->is_page_owner($page_id, $current_user_id) && !current_user_can('manage_options')) {
+        if (!$this->isPageOwner($page_id, $current_user_id) && !current_user_can('manage_options')) {
             return $this->error('forbidden', 'Access denied.', 403);
         }
 
-        $votes_table    = $this->trust_table('trust_votes');
-        $disputes_table = BCC_Disputes_DB::disputes_table();
+        $disputes_table = DisputeRepository::disputes_table();
+        $service = ServiceLocator::resolveTrustReadService();
 
-        // Replace correlated subquery with a LEFT JOIN + COUNT to avoid N+1 per row.
-        $votes = $wpdb->get_results($wpdb->prepare(
-            "SELECT v.id, v.voter_user_id, v.vote_type, v.weight, v.reason, v.created_at,
-                    u.display_name,
-                    COUNT(d.id) AS dispute_count
-             FROM {$votes_table} v
-             LEFT JOIN {$wpdb->users} u ON v.voter_user_id = u.ID
-             LEFT JOIN {$disputes_table} d
-                    ON d.vote_id = v.id AND d.status IN ('pending','reviewing','accepted')
-             WHERE v.page_id = %d AND v.status = 1
-             GROUP BY v.id, v.voter_user_id, v.vote_type, v.weight, v.reason, v.created_at, u.display_name
-             ORDER BY v.created_at DESC",
-            $page_id
-        ));
+        if (!$service instanceof TrustReadServiceInterface) {
+            Logger::logFailure('trust_read_service_missing', [
+                'page_id' => $page_id,
+                'operation' => 'list_votes',
+            ]);
 
-        return rest_ensure_response(array_map(function ($v) {
+            return $this->error('trust_service_unavailable', 'Trust service unavailable.', 503);
+        }
+
+        $votes = $service->getActiveVotesForPage($page_id);
+        $voteIds = array_map(static fn(array $vote): int => (int) $vote['id'], $votes);
+        $disputedVoteIds = [];
+
+        if (!empty($voteIds)) {
+            $placeholders = implode(',', array_fill(0, count($voteIds), '%d'));
+            $rows = $wpdb->get_col($wpdb->prepare(
+                "SELECT DISTINCT vote_id
+                 FROM {$disputes_table}
+                 WHERE vote_id IN ({$placeholders})
+                   AND status IN ('pending','reviewing','accepted')",
+                ...$voteIds
+            ));
+
+            $disputedVoteIds = array_fill_keys(array_map('intval', $rows), true);
+        }
+
+        return rest_ensure_response(array_map(function (array $vote) use ($disputedVoteIds) {
             return [
-                'id'             => (int) $v->id,
-                'voter_name'     => $v->display_name ?? 'Unknown',
-                'vote_type'      => (int) $v->vote_type > 0 ? 'upvote' : 'downvote',
-                'weight'         => round((float) $v->weight, 2),
-                'reason'         => $v->reason ?? '',
-                'date'           => $v->created_at,
-                'already_disputed' => (int) $v->dispute_count > 0,
+                'id' => (int) $vote['id'],
+                'voter_name' => $vote['voter_name'] ?? 'Unknown',
+                'vote_type' => (int) $vote['vote_type'] > 0 ? 'upvote' : 'downvote',
+                'weight' => round((float) $vote['weight'], 2),
+                'reason' => $vote['reason'] ?? '',
+                'date' => $vote['created_at'] ?? null,
+                'already_disputed' => isset($disputedVoteIds[(int) $vote['id']]),
             ];
         }, $votes));
     }
@@ -215,20 +244,21 @@ class BCC_Disputes_API
     public function mine(WP_REST_Request $req): WP_REST_Response
     {
         global $wpdb;
-        $uid = get_current_user_id();
-        $dt  = BCC_Disputes_DB::disputes_table();
+
+        $userId       = get_current_user_id();
+        $disputeTable = DisputeRepository::disputes_table();
 
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT d.*, p.post_title as page_title, u.display_name as voter_name
-             FROM {$dt} d
+             FROM {$disputeTable} d
              LEFT JOIN {$wpdb->posts} p ON d.page_id = p.ID
              LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
              WHERE d.reporter_id = %d
              ORDER BY d.created_at DESC",
-            $uid
+            $userId
         ));
 
-        return rest_ensure_response(array_map([$this, 'format_dispute'], $rows));
+        return rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
     }
 
     // ── Panel queue ───────────────────────────────────────────────────────────
@@ -236,24 +266,25 @@ class BCC_Disputes_API
     public function panel_queue(WP_REST_Request $req): WP_REST_Response
     {
         global $wpdb;
-        $uid = get_current_user_id();
-        $dt  = BCC_Disputes_DB::disputes_table();
-        $pt  = BCC_Disputes_DB::panel_table();
+
+        $userId       = get_current_user_id();
+        $disputeTable = DisputeRepository::disputes_table();
+        $panelTable   = DisputeRepository::panel_table();
 
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT d.*, pan.decision as my_decision, pan.voted_at as my_voted_at,
                     p.post_title as page_title, u.display_name as voter_name
-             FROM {$pt} pan
-             JOIN {$dt} d ON d.id = pan.dispute_id
+             FROM {$panelTable} pan
+             JOIN {$disputeTable} d ON d.id = pan.dispute_id
              LEFT JOIN {$wpdb->posts} p ON d.page_id = p.ID
              LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
              WHERE pan.panelist_user_id = %d
                AND d.status IN ('pending','reviewing')
              ORDER BY d.created_at ASC",
-            $uid
+            $userId
         ));
 
-        return rest_ensure_response(array_map([$this, 'format_dispute'], $rows));
+        return rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
     }
 
     // ── Cast panel vote ───────────────────────────────────────────────────────
@@ -265,15 +296,15 @@ class BCC_Disputes_API
         $dispute_id = (int) $req->get_param('id');
         $decision   = $req->get_param('decision'); // 'accept' | 'reject'
         $note       = $req->get_param('note') ?? '';
-        $uid        = get_current_user_id();
+        $userId     = get_current_user_id();
 
-        $dt = BCC_Disputes_DB::disputes_table();
-        $pt = BCC_Disputes_DB::panel_table();
+        $disputeTable = DisputeRepository::disputes_table();
+        $panelTable   = DisputeRepository::panel_table();
 
         // Confirm this user is assigned to this dispute
         $assignment = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$pt} WHERE dispute_id = %d AND panelist_user_id = %d LIMIT 1",
-            $dispute_id, $uid
+            "SELECT * FROM {$panelTable} WHERE dispute_id = %d AND panelist_user_id = %d LIMIT 1",
+            $dispute_id, $userId
         ));
         if (!$assignment) {
             return $this->error('not_assigned', 'You are not assigned to this dispute.', 403);
@@ -283,38 +314,64 @@ class BCC_Disputes_API
         }
 
         $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$dt} WHERE id = %d LIMIT 1",
+            "SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1",
             $dispute_id
         ));
         if (!$dispute || !in_array($dispute->status, ['pending', 'reviewing'], true)) {
             return $this->error('dispute_closed', 'This dispute is no longer open.', 410);
         }
 
-        // Record vote
-        $wpdb->update($pt,
-            ['decision' => $decision, 'note' => $note, 'voted_at' => current_time('mysql')],
-            ['dispute_id' => $dispute_id, 'panelist_user_id' => $uid],
-            ['%s', '%s', '%s'], ['%d', '%d']
-        );
+        // Transaction: vote recording + tally must be atomic.
+        // If the vote records but tally fails, the panelist can't revote and
+        // the dispute may never auto-resolve.
+        $wpdb->query('START TRANSACTION');
 
-        if ($wpdb->last_error) {
-            error_log('BCC Disputes DB error (panel vote): ' . $wpdb->last_error);
+        // Atomic vote recording: UPDATE … WHERE decision IS NULL prevents double-voting
+        // even under concurrent requests (the second request gets 0 affected rows).
+        $voted = $wpdb->query($wpdb->prepare(
+            "UPDATE {$panelTable} SET decision = %s, note = %s, voted_at = %s
+             WHERE dispute_id = %d AND panelist_user_id = %d AND decision IS NULL",
+            $decision, $note, current_time('mysql'), $dispute_id, $userId
+        ));
+
+        if ($voted === false) {
+            $wpdb->query('ROLLBACK');
+            Logger::logFailure('cast_vote_rollback', [
+                'dispute_id' => $dispute_id,
+                'user_id'    => $userId,
+                'step'       => 'panel_vote_update',
+                'db_error'   => $wpdb->last_error,
+            ]);
+            return $this->error('db_error', 'Failed to record vote.', 500);
+        }
+        if ($voted === 0) {
+            $wpdb->query('ROLLBACK');
+            return $this->error('already_voted', 'You have already voted on this dispute.', 409);
         }
 
         // Atomic tally update — avoids race condition when two panelists vote simultaneously
         $col = $decision === 'accept' ? 'panel_accepts' : 'panel_rejects';
-        $wpdb->query($wpdb->prepare(
-            "UPDATE {$dt} SET {$col} = {$col} + 1 WHERE id = %d",
+        $tally_ok = $wpdb->query($wpdb->prepare(
+            "UPDATE {$disputeTable} SET {$col} = {$col} + 1 WHERE id = %d",
             $dispute_id
         ));
 
-        if ($wpdb->last_error) {
-            error_log('BCC Disputes DB error (tally update): ' . $wpdb->last_error);
+        if ($tally_ok === false) {
+            $wpdb->query('ROLLBACK');
+            Logger::logFailure('cast_vote_rollback', [
+                'dispute_id' => $dispute_id,
+                'user_id'    => $userId,
+                'step'       => 'tally_increment',
+                'db_error'   => $wpdb->last_error,
+            ]);
+            return $this->error('db_error', 'Failed to update tally.', 500);
         }
+
+        $wpdb->query('COMMIT');
 
         // Re-fetch for accurate majority check after atomic update
         $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$dt} WHERE id = %d LIMIT 1",
+            "SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1",
             $dispute_id
         ));
 
@@ -346,11 +403,15 @@ class BCC_Disputes_API
         $dispute_id = (int) $req->get_param('id');
         $decision   = $req->get_param('decision'); // 'accepted' | 'rejected'
 
-        $dt      = BCC_Disputes_DB::disputes_table();
-        $dispute = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$dt} WHERE id = %d LIMIT 1", $dispute_id));
+        $disputeTable = DisputeRepository::disputes_table();
+        $dispute      = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1", $dispute_id));
 
         if (!$dispute) {
             return $this->error('not_found', 'Dispute not found.', 404);
+        }
+
+        if (!in_array($dispute->status, ['pending', 'reviewing'], true)) {
+            return $this->error('already_resolved', 'This dispute has already been resolved.', 409);
         }
 
         $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $decision);
@@ -362,73 +423,35 @@ class BCC_Disputes_API
 
     public function resolve(int $dispute_id, int $vote_id, int $page_id, int $voter_id, int $reporter_id, string $outcome): void
     {
-        global $wpdb;
-
-        $dt = BCC_Disputes_DB::disputes_table();
-
-        $wpdb->update($dt,
-            ['status' => $outcome, 'resolved_at' => current_time('mysql')],
-            ['id' => $dispute_id],
-            ['%s', '%s'], ['%d']
-        );
-
-        if ($wpdb->last_error) {
-            error_log('BCC Disputes DB error (resolve dispute): ' . $wpdb->last_error);
-        }
-
-        if ($outcome === 'accepted') {
-            // Soft-delete the disputed vote
-            $votes_table = $this->trust_table('trust_votes');
-
-            $wpdb->update(
-                $votes_table,
-                ['status' => 0, 'updated_at' => current_time('mysql')],
-                ['id' => $vote_id],
-                ['%d', '%s'], ['%d']
-            );
-
-            if ($wpdb->last_error) {
-                error_log('BCC Disputes DB error (soft-delete vote): ' . $wpdb->last_error);
-            }
-
-            // Schedule a score recalculation for this page
-            wp_schedule_single_event(time() + 30, 'bcc_disputes_recalculate_score', [$page_id]);
-
-            // Apply a weight penalty to the voter (increase their fraud_score slightly)
-            $this->penalise_voter($voter_id);
-
-            do_action('bcc_dispute_accepted', $dispute_id, $vote_id, $page_id, $voter_id);
-        } else {
-            do_action('bcc_dispute_rejected', $dispute_id, $vote_id, $page_id);
-        }
-
-        // Notify the reporter — reporter_id passed directly, no re-fetch needed
-        $reporter = get_userdata($reporter_id);
-        if ($reporter && $reporter->user_email) {
-            $subject = $outcome === 'accepted'
-                ? '[BCC] Your dispute was accepted — vote removed'
-                : '[BCC] Your dispute was reviewed — vote stands';
-            $body = $outcome === 'accepted'
-                ? 'Good news! The community panel reviewed your dispute and agreed the vote was invalid. It has been removed from your trust score.'
-                : 'The community panel reviewed your dispute and decided the vote was valid. The vote remains on your profile.';
-            wp_mail($reporter->user_email, $subject, $body);
-        }
+        Plugin::instance()->resolve_dispute_service()->handle(new ResolveDisputeCommand(
+            $dispute_id,
+            $vote_id,
+            $page_id,
+            $voter_id,
+            $reporter_id,
+            $outcome
+        ));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private function get_vote(int $vote_id): ?object
+    private function getVote(int $vote_id): ?object
     {
-        global $wpdb;
-        $table = $this->trust_table('trust_votes');
+        $service = ServiceLocator::resolveTrustReadService();
 
-        return $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$table} WHERE id = %d AND status = 1 LIMIT 1",
-            $vote_id
-        ));
+        if (!$service instanceof TrustReadServiceInterface) {
+            Logger::logFailure('trust_read_service_missing', [
+                'vote_id' => $vote_id,
+            ]);
+            return null;
+        }
+
+        $vote = $service->getVoteById($vote_id);
+
+        return $vote ? (object) $vote : null;
     }
 
-    private function is_page_owner(int $page_id, int $user_id): bool
+    private function isPageOwner(int $page_id, int $user_id): bool
     {
         if (class_exists('BCC\\Core\\Permissions\\Permissions')) {
             return \BCC\Core\Permissions\Permissions::owns_page($page_id, $user_id);
@@ -445,35 +468,26 @@ class BCC_Disputes_API
      * Pick up to BCC_DISPUTES_PANEL_SIZE Gold/Platinum users,
      * excluding the reporter and the voter.
      */
-    private function select_panelists(int $reporter_id, int $voter_id): array
+    private function selectPanelists(int $reporter_id, int $voter_id): array
     {
-        global $wpdb;
-        $scores = $this->trust_table('trust_page_scores');
-
         $needed = defined('BCC_DISPUTES_PANEL_SIZE') ? BCC_DISPUTES_PANEL_SIZE : 3;
+        $service = ServiceLocator::resolveTrustReadService();
 
-        // SQL-level random sampling — avoids fetching all eligible users into PHP
-        $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT DISTINCT page_owner_id as user_id
-             FROM {$scores}
-             WHERE reputation_tier IN ('gold','platinum')
-               AND page_owner_id NOT IN (%d, %d)
-               AND page_owner_id > 0
-             ORDER BY RAND()
-             LIMIT %d",
-            $reporter_id,
-            $voter_id,
-            $needed
-        ));
 
-        if (empty($rows)) {
+        if (!$service instanceof TrustReadServiceInterface) {
+            Logger::logFailure('trust_read_service_missing', [
+                'reporter_id' => $reporter_id,
+                'voter_id' => $voter_id,
+                'operation' => 'select_panelists',
+            ]);
+
             return [];
         }
 
-        return array_map(fn($r) => (int) $r->user_id, $rows);
+        return $service->getEligiblePanelistUserIds([$reporter_id, $voter_id], $needed);
     }
 
-    private function notify_panelist(int $uid, int $dispute_id, int $page_id): void
+    private function notifyPanelist(int $uid, int $dispute_id, int $page_id): void
     {
         $user = get_userdata($uid);
         if (!$user || !$user->user_email) {
@@ -491,25 +505,7 @@ class BCC_Disputes_API
         wp_mail($user->user_email, $subject, $body);
     }
 
-    private function penalise_voter(int $voter_id): void
-    {
-        global $wpdb;
-
-        $table = $this->trust_table('trust_user_info');
-
-        $wpdb->query($wpdb->prepare(
-            "UPDATE {$table}
-             SET fraud_score = LEAST(100, fraud_score + 5)
-             WHERE user_id = %d",
-            $voter_id
-        ));
-
-        if ($wpdb->last_error) {
-            error_log('BCC Disputes DB error (penalise voter): ' . $wpdb->last_error);
-        }
-    }
-
-    private function format_dispute(object $d): array
+    private function formatDispute(object $d): array
     {
         return [
             'id'           => (int) $d->id,
@@ -557,9 +553,9 @@ class BCC_Disputes_API
             return $this->error('detail_required', 'Please provide at least 10 characters describing your reason.', 400);
         }
 
-        $rt = BCC_Disputes_DB::user_reports_table();
+        $reportTable = DisputeRepository::user_reports_table();
 
-        $wpdb->insert( $rt, [
+        $wpdb->insert( $reportTable, [
             'reported_id'   => $reported_id,
             'reporter_id'   => $reporter_id,
             'reason_key'    => $reason_key,
@@ -573,15 +569,15 @@ class BCC_Disputes_API
 
         $report_id = (int) $wpdb->insert_id;
 
-        $this->email_reported_user( $reported_user );
-        $this->email_admin_report( $report_id, $reporter_id, $reported_user, $reason_key, $reason_detail );
+        $this->emailReportedUser( $reported_user );
+        $this->emailAdminReport( $report_id, $reporter_id, $reported_user, $reason_key, $reason_detail );
 
         return rest_ensure_response([
             'message' => 'Your report has been submitted. Our team will review it shortly.',
         ]);
     }
 
-    private function email_reported_user( WP_User $reported_user ): void
+    private function emailReportedUser( WP_User $reported_user ): void
     {
         $site_name = get_bloginfo('name');
         $subject   = sprintf( '[%s] Your account has received a report', $site_name );
@@ -594,7 +590,7 @@ class BCC_Disputes_API
         wp_mail( $reported_user->user_email, $subject, $body );
     }
 
-    private function email_admin_report( int $report_id, int $reporter_id, WP_User $reported_user, string $reason_key, string $reason_detail ): void
+    private function emailAdminReport( int $report_id, int $reporter_id, WP_User $reported_user, string $reason_key, string $reason_detail ): void
     {
         $admin_email   = get_option('admin_email');
         $site_name     = get_bloginfo('name');
@@ -671,25 +667,9 @@ class BCC_Disputes_API
         return null;
     }
 
-    private function trust_table(string $name): string
-    {
-        if (class_exists('BCC\\Core\\DB\\DB')) {
-            return \BCC\Core\DB\DB::table($name);
-        }
-        $helpers = [
-            'trust_votes'       => 'bcc_trust_votes_table',
-            'trust_page_scores' => 'bcc_trust_scores_table',
-            'trust_user_info'   => 'bcc_trust_user_info_table',
-        ];
-        if (isset($helpers[$name]) && function_exists($helpers[$name])) {
-            return ($helpers[$name])();
-        }
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_' . $name;
-    }
-
     private function error(string $code, string $message, int $status): WP_REST_Response
     {
         return new WP_REST_Response(['code' => $code, 'message' => $message], $status);
     }
+
 }

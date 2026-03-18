@@ -156,6 +156,5 @@ All endpoints require authentication (`X-WP-Nonce` header).
 |---|---|---|
 | `BCC_DISPUTES_PANEL_SIZE` | `5` | Number of panelists assigned per dispute |
 | `BCC_DISPUTES_TTL_DAYS` | `7` | Days before an unresolved dispute auto-resolves |
-| `BCC_DISPUTES_MIN_TIER` | `'gold'` | Minimum reputation tier to be selected as a panelist |
 
 These are defined in `bcc-disputes.php` and can be overridden by re-defining them in `wp-config.php` before the plugin loads.
