@@ -92,9 +92,6 @@ class DisputeListTable extends WP_List_Table
         global $wpdb;
 
         $disputeTable = DisputeRepository::disputes_table();
-        $votes_table = function_exists('bcc_trust_votes_table')
-            ? bcc_trust_votes_table()
-            : $wpdb->prefix . 'bcc_trust_votes';
 
         // Filters
         $where  = '1=1';
@@ -130,17 +127,15 @@ class DisputeListTable extends WP_List_Table
             'total_pages' => ceil($total / $per_page),
         ]);
 
-        // Query
+        // Query — own tables + WordPress core only.
         $sql = "SELECT d.*,
                        p.post_title   AS page_title,
                        reporter.display_name AS reporter_name,
-                       voter.display_name    AS voter_name,
-                       v.vote_type
+                       voter.display_name    AS voter_name
                 FROM {$disputeTable} d
                 LEFT JOIN {$wpdb->posts} p         ON d.page_id     = p.ID
                 LEFT JOIN {$wpdb->users} reporter   ON d.reporter_id = reporter.ID
                 LEFT JOIN {$wpdb->users} voter      ON d.voter_id    = voter.ID
-                LEFT JOIN {$votes_table} v          ON d.vote_id     = v.id
                 WHERE {$where}
                 ORDER BY d.{$orderby} {$order}
                 LIMIT %d OFFSET %d";
@@ -149,6 +144,26 @@ class DisputeListTable extends WP_List_Table
         $params[] = $offset;
 
         $this->items = $wpdb->get_results($wpdb->prepare($sql, ...$params));
+
+        // Batch-enrich with vote data from trust-engine via interface.
+        $vote_ids = array_filter(array_map(
+            static fn($item): int => (int) $item->vote_id,
+            $this->items
+        ));
+
+        $votes_by_id = [];
+        if (!empty($vote_ids)) {
+            $trustService = \BCC\Core\ServiceLocator::resolveTrustReadService();
+            if ($trustService) {
+                $votes_by_id = $trustService->getVotesByIds($vote_ids);
+            }
+        }
+
+        // Merge vote_type onto each dispute row for column rendering.
+        foreach ($this->items as $item) {
+            $vid = (int) $item->vote_id;
+            $item->vote_type = isset($votes_by_id[$vid]) ? $votes_by_id[$vid]['vote_type'] : null;
+        }
 
         $this->_column_headers = [
             $this->get_columns(),

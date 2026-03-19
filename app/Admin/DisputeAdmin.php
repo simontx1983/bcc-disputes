@@ -85,22 +85,16 @@ class DisputeAdmin
         $disputeTable = DisputeRepository::disputes_table();
         $panelTable   = DisputeRepository::panel_table();
 
-        $votes_table = function_exists('bcc_trust_votes_table')
-            ? bcc_trust_votes_table()
-            : $wpdb->prefix . 'bcc_trust_votes';
-
-        // Fetch dispute with joined data.
+        // Fetch dispute — own tables + WordPress core only.
         $dispute = $wpdb->get_row($wpdb->prepare(
             "SELECT d.*,
                     p.post_title   AS page_title,
                     reporter.display_name AS reporter_name,
-                    voter.display_name    AS voter_name,
-                    v.vote_type, v.weight, v.reason AS vote_reason, v.created_at AS vote_date
+                    voter.display_name    AS voter_name
              FROM {$disputeTable} d
              LEFT JOIN {$wpdb->posts} p         ON d.page_id     = p.ID
              LEFT JOIN {$wpdb->users} reporter   ON d.reporter_id = reporter.ID
              LEFT JOIN {$wpdb->users} voter      ON d.voter_id    = voter.ID
-             LEFT JOIN {$votes_table} v          ON d.vote_id     = v.id
              WHERE d.id = %d
              LIMIT 1",
             $dispute_id
@@ -109,6 +103,14 @@ class DisputeAdmin
         if (!$dispute) {
             echo '<div class="wrap"><h1>' . esc_html__('Dispute Not Found', 'bcc-disputes') . '</h1></div>';
             return;
+        }
+
+        // Enrich with vote data from trust-engine via interface.
+        $vote = null;
+        $trustService = \BCC\Core\ServiceLocator::resolveTrustReadService();
+        if ($trustService && $dispute->vote_id) {
+            $votes = $trustService->getVotesByIds([(int) $dispute->vote_id]);
+            $vote  = $votes[(int) $dispute->vote_id] ?? null;
         }
 
         // Panel votes.
@@ -169,19 +171,26 @@ class DisputeAdmin
         // Vote details card
         echo '<div class="card" style="max-width:none;margin-top:16px;">';
         echo '<h2>' . esc_html__('Disputed Vote', 'bcc-disputes') . '</h2>';
+
+        if (!$vote && $dispute->vote_id) {
+            echo '<p class="description" style="color:#b71c1c;">'
+               . esc_html__('Vote data unavailable — trust engine may be inactive.', 'bcc-disputes')
+               . '</p>';
+        }
+
         echo '<table class="widefat striped" style="border:none;">';
         self::detail_row(__('Vote ID', 'bcc-disputes'), '#' . (int) $dispute->vote_id);
         self::detail_row(__('Page', 'bcc-disputes'), esc_html($dispute->page_title ?: '(no title)') . ' (#' . (int) $dispute->page_id . ')');
         self::detail_row(__('Voter', 'bcc-disputes'), esc_html($dispute->voter_name ?: 'Unknown') . ' (#' . (int) $dispute->voter_id . ')');
 
         $vote_label = '—';
-        if ($dispute->vote_type !== null) {
-            $vote_label = (int) $dispute->vote_type > 0 ? '▲ Upvote' : '▼ Downvote';
+        if ($vote !== null) {
+            $vote_label = $vote['vote_type'] > 0 ? '▲ Upvote' : '▼ Downvote';
         }
         self::detail_row(__('Vote Type', 'bcc-disputes'), esc_html($vote_label));
-        self::detail_row(__('Weight', 'bcc-disputes'), $dispute->weight !== null ? round((float) $dispute->weight, 2) : '—');
-        self::detail_row(__('Vote Reason', 'bcc-disputes'), esc_html($dispute->vote_reason ?: '(none)'));
-        self::detail_row(__('Vote Date', 'bcc-disputes'), esc_html($dispute->vote_date ?: '—'));
+        self::detail_row(__('Weight', 'bcc-disputes'), $vote !== null ? round($vote['weight'], 2) : '—');
+        self::detail_row(__('Vote Reason', 'bcc-disputes'), esc_html($vote ? ($vote['reason'] ?: '(none)') : '—'));
+        self::detail_row(__('Vote Date', 'bcc-disputes'), esc_html($vote ? ($vote['created_at'] ?: '—') : '—'));
         echo '</table>';
         echo '</div>';
 
