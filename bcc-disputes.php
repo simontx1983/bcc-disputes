@@ -20,10 +20,29 @@ define('BCC_DISPUTES_URL', plugin_dir_url(__FILE__));
 define('BCC_DISPUTES_PANEL_SIZE', 5);     // panelists per dispute
 define('BCC_DISPUTES_TTL_DAYS', 7);       // auto-resolve after N days
 
-$bcc_disputes_autoloader = BCC_DISPUTES_PATH . 'vendor/autoload.php';
-if (file_exists($bcc_disputes_autoloader)) {
-    require_once $bcc_disputes_autoloader;
+// ── Dependency check — bcc-core must be active ──────────────────────────────
+if ( ! defined( 'BCC_CORE_VERSION' ) ) {
+    add_action( 'admin_notices', function () {
+        echo '<div class="notice notice-error"><p>'
+           . '<strong>BCC Disputes:</strong> '
+           . 'The <strong>BCC Core</strong> plugin must be activated first. '
+           . 'Please activate BCC Core, then re-activate BCC Disputes.'
+           . '</p></div>';
+    } );
+    return;
 }
+
+$bcc_disputes_autoloader = BCC_DISPUTES_PATH . 'vendor/autoload.php';
+if ( ! file_exists( $bcc_disputes_autoloader ) ) {
+    add_action( 'admin_notices', function () {
+        echo '<div class="notice notice-error"><p>'
+           . '<strong>BCC Disputes:</strong> '
+           . 'Run <code>composer install</code> in the plugin directory to generate the autoloader.'
+           . '</p></div>';
+    } );
+    return;
+}
+require_once $bcc_disputes_autoloader;
 
 if (is_admin()) {
     \BCC\Disputes\Admin\DisputeAdmin::boot();
