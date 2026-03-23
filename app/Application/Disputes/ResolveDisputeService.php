@@ -108,7 +108,7 @@ final class ResolveDisputeService
 
     private function resolveAdjudicator(): ?DisputeAdjudicationInterface
     {
-        $service = ServiceLocator::resolveDisputeAdjudication();
+        $service = class_exists('\\BCC\\Core\\ServiceLocator') ? ServiceLocator::resolveDisputeAdjudication() : null;
 
         if ($service instanceof DisputeAdjudicationInterface) {
             return $service;

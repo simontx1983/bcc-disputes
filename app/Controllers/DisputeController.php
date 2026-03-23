@@ -198,7 +198,7 @@ class DisputeController
         }
 
         $disputes_table = DisputeRepository::disputes_table();
-        $service = ServiceLocator::resolveTrustReadService();
+        $service = class_exists('\\BCC\\Core\\ServiceLocator') ? ServiceLocator::resolveTrustReadService() : null;
 
         if (!$service instanceof TrustReadServiceInterface) {
             Logger::logFailure('trust_read_service_missing', [
@@ -437,7 +437,7 @@ class DisputeController
 
     private function getVote(int $vote_id): ?object
     {
-        $service = ServiceLocator::resolveTrustReadService();
+        $service = class_exists('\\BCC\\Core\\ServiceLocator') ? ServiceLocator::resolveTrustReadService() : null;
 
         if (!$service instanceof TrustReadServiceInterface) {
             Logger::logFailure('trust_read_service_missing', [
@@ -471,7 +471,7 @@ class DisputeController
     private function selectPanelists(int $reporter_id, int $voter_id): array
     {
         $needed = defined('BCC_DISPUTES_PANEL_SIZE') ? BCC_DISPUTES_PANEL_SIZE : 3;
-        $service = ServiceLocator::resolveTrustReadService();
+        $service = class_exists('\\BCC\\Core\\ServiceLocator') ? ServiceLocator::resolveTrustReadService() : null;
 
 
         if (!$service instanceof TrustReadServiceInterface) {

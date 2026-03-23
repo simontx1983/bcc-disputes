@@ -153,7 +153,7 @@ class DisputeListTable extends WP_List_Table
 
         $votes_by_id = [];
         if (!empty($vote_ids)) {
-            $trustService = \BCC\Core\ServiceLocator::resolveTrustReadService();
+            $trustService = class_exists('\\BCC\\Core\\ServiceLocator') ? \BCC\Core\ServiceLocator::resolveTrustReadService() : null;
             if ($trustService) {
                 $votes_by_id = $trustService->getVotesByIds($vote_ids);
             }

@@ -107,7 +107,7 @@ class DisputeAdmin
 
         // Enrich with vote data from trust-engine via interface.
         $vote = null;
-        $trustService = \BCC\Core\ServiceLocator::resolveTrustReadService();
+        $trustService = class_exists('\\BCC\\Core\\ServiceLocator') ? \BCC\Core\ServiceLocator::resolveTrustReadService() : null;
         if ($trustService && $dispute->vote_id) {
             $votes = $trustService->getVotesByIds([(int) $dispute->vote_id]);
             $vote  = $votes[(int) $dispute->vote_id] ?? null;
