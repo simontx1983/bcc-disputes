@@ -9,9 +9,12 @@ return array(
     'BCC\\Disputes\\Admin\\DisputeAdmin' => $baseDir . '/app/Admin/DisputeAdmin.php',
     'BCC\\Disputes\\Admin\\DisputeListTable' => $baseDir . '/app/Admin/DisputeListTable.php',
     'BCC\\Disputes\\Admin\\ReportListTable' => $baseDir . '/app/Admin/ReportListTable.php',
+    'BCC\\Disputes\\Application\\Disputes\\ResolveDisputeCommand' => $baseDir . '/app/Application/Disputes/ResolveDisputeCommand.php',
+    'BCC\\Disputes\\Application\\Disputes\\ResolveDisputeService' => $baseDir . '/app/Application/Disputes/ResolveDisputeService.php',
     'BCC\\Disputes\\Controllers\\DisputeController' => $baseDir . '/app/Controllers/DisputeController.php',
     'BCC\\Disputes\\Plugin' => $baseDir . '/app/Plugin.php',
     'BCC\\Disputes\\Repositories\\DisputeRepository' => $baseDir . '/app/Repositories/DisputeRepository.php',
     'BCC\\Disputes\\Services\\DisputeScheduler' => $baseDir . '/app/Services/DisputeScheduler.php',
+    'BCC\\Disputes\\Support\\Logger' => $baseDir . '/app/Support/Logger.php',
     'Composer\\InstalledVersions' => $vendorDir . '/composer/InstalledVersions.php',
 );

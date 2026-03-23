@@ -24,10 +24,13 @@ class ComposerStaticInitfea82a1ae4f0983138c76448a7c82233
         'BCC\\Disputes\\Admin\\DisputeAdmin' => __DIR__ . '/../..' . '/app/Admin/DisputeAdmin.php',
         'BCC\\Disputes\\Admin\\DisputeListTable' => __DIR__ . '/../..' . '/app/Admin/DisputeListTable.php',
         'BCC\\Disputes\\Admin\\ReportListTable' => __DIR__ . '/../..' . '/app/Admin/ReportListTable.php',
+        'BCC\\Disputes\\Application\\Disputes\\ResolveDisputeCommand' => __DIR__ . '/../..' . '/app/Application/Disputes/ResolveDisputeCommand.php',
+        'BCC\\Disputes\\Application\\Disputes\\ResolveDisputeService' => __DIR__ . '/../..' . '/app/Application/Disputes/ResolveDisputeService.php',
         'BCC\\Disputes\\Controllers\\DisputeController' => __DIR__ . '/../..' . '/app/Controllers/DisputeController.php',
         'BCC\\Disputes\\Plugin' => __DIR__ . '/../..' . '/app/Plugin.php',
         'BCC\\Disputes\\Repositories\\DisputeRepository' => __DIR__ . '/../..' . '/app/Repositories/DisputeRepository.php',
         'BCC\\Disputes\\Services\\DisputeScheduler' => __DIR__ . '/../..' . '/app/Services/DisputeScheduler.php',
+        'BCC\\Disputes\\Support\\Logger' => __DIR__ . '/../..' . '/app/Support/Logger.php',
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
     );
 
