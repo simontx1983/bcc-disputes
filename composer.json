@@ -10,5 +10,8 @@
     },
     "require": {
         "php": ">=7.4"
+    },
+    "config": {
+        "optimize-autoloader": true
     }
 }

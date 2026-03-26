@@ -138,7 +138,11 @@ class DisputeController
             return $this->error('already_disputed', 'This vote already has an active dispute.', 409);
         }
 
-        // Insert dispute
+        // Insert dispute + panelists atomically
+        $panelists = $this->selectPanelists($current_user_id, $voter_id);
+
+        $wpdb->query('START TRANSACTION');
+
         $wpdb->insert($disputeTable, [
             'vote_id'      => $vote_id,
             'page_id'      => $page_id,
@@ -153,12 +157,11 @@ class DisputeController
         $dispute_id = $wpdb->insert_id;
 
         if (!$dispute_id) {
+            $wpdb->query('ROLLBACK');
             return $this->error('db_error', 'Failed to create dispute.', 500);
         }
 
-        // Assign panelists
-        $panelists = $this->selectPanelists($current_user_id, $voter_id);
-
+        $panel_ok = true;
         foreach ($panelists as $uid) {
             $wpdb->insert($panelTable, [
                 'dispute_id'       => $dispute_id,
@@ -171,8 +174,20 @@ class DisputeController
                     'panelist_id' => $uid,
                     'db_error'    => $wpdb->last_error,
                 ]);
+                $panel_ok = false;
+                break;
             }
+        }
 
+        if (!$panel_ok) {
+            $wpdb->query('ROLLBACK');
+            return $this->error('db_error', 'Failed to assign panelists.', 500);
+        }
+
+        $wpdb->query('COMMIT');
+
+        // Notifications sent after commit — outside the transaction
+        foreach ($panelists as $uid) {
             $this->notifyPanelist($uid, $dispute_id, $page_id);
         }
 
@@ -455,10 +470,6 @@ class DisputeController
     {
         if (class_exists('BCC\\Core\\Permissions\\Permissions')) {
             return \BCC\Core\Permissions\Permissions::owns_page($page_id, $user_id);
-        }
-        // Fallback: check via trust engine helper or post author
-        if (function_exists('bcc_trust_get_page_owner')) {
-            return bcc_trust_get_page_owner($page_id) === $user_id;
         }
         $post = get_post($page_id);
         return $post && (int) $post->post_author === $user_id;

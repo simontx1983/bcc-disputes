@@ -4,6 +4,7 @@ namespace BCC\Disputes\Application\Disputes;
 
 use BCC\Core\Contracts\DisputeAdjudicationInterface;
 use BCC\Core\ServiceLocator;
+use BCC\Disputes\Repositories\DisputeRepository;
 use BCC\Disputes\Support\Logger;
 
 if (!defined('ABSPATH')) {
@@ -16,7 +17,7 @@ final class ResolveDisputeService
     {
         global $wpdb;
 
-        $disputeTable = $wpdb->prefix . 'bcc_disputes';
+        $disputeTable = DisputeRepository::disputes_table();
 
         $wpdb->query('START TRANSACTION');
 

@@ -12,7 +12,6 @@ if (!defined('ABSPATH')) {
 class DisputeScheduler
 {
     const EVENT_AUTO_RESOLVE = 'bcc_disputes_auto_resolve';
-    const EVENT_RECALC       = 'bcc_disputes_recalculate_score';
 
     public static function schedule(): void
     {
@@ -24,13 +23,11 @@ class DisputeScheduler
     public static function unschedule(): void
     {
         wp_clear_scheduled_hook(self::EVENT_AUTO_RESOLVE);
-        wp_unschedule_hook(self::EVENT_RECALC);
     }
 
     public static function boot(): void
     {
         add_action(self::EVENT_AUTO_RESOLVE, [__CLASS__, 'auto_resolve_expired']);
-        add_action(self::EVENT_RECALC, [__CLASS__, 'recalculate_page_score']);
     }
 
     /**
@@ -43,12 +40,14 @@ class DisputeScheduler
         global $wpdb;
 
         $disputeTable = DisputeRepository::disputes_table();
-        $cutoff       = date('Y-m-d H:i:s', strtotime('-' . BCC_DISPUTES_TTL_DAYS . ' days'));
+        $cutoff       = date('Y-m-d H:i:s', current_time('timestamp') - (BCC_DISPUTES_TTL_DAYS * DAY_IN_SECONDS));
 
         $expired = $wpdb->get_results($wpdb->prepare(
             "SELECT * FROM {$disputeTable}
              WHERE status IN ('pending','reviewing')
-               AND created_at <= %s",
+               AND created_at <= %s
+             ORDER BY created_at ASC
+             LIMIT 50",
             $cutoff
         ));
 
@@ -64,21 +63,4 @@ class DisputeScheduler
         }
     }
 
-    /**
-     * Re-run trust score calculation for a page after an accepted dispute.
-     * Hooked from wp_schedule_single_event in the API.
-     */
-    public static function recalculate_page_score(int $page_id): void
-    {
-        if (function_exists('bcc_trust_recalculate_page_score')) {
-            bcc_trust_recalculate_page_score($page_id);
-            return;
-        }
-
-        if (class_exists('BCC\\Core\\Log\\Logger')) {
-            \BCC\Core\Log\Logger::error('[bcc-disputes] trust_recalc_unavailable', [
-                'page_id' => $page_id,
-            ]);
-        }
-    }
 }
