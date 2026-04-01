@@ -2,7 +2,7 @@
 
 namespace BCC\Disputes\Services;
 
-use BCC\Disputes\Plugin;
+use BCC\Disputes\Controllers\DisputeController;
 use BCC\Disputes\Repositories\DisputeRepository;
 
 if (!defined('ABSPATH')) {
@@ -55,7 +55,7 @@ class DisputeScheduler
             return;
         }
 
-        $api = Plugin::instance()->controller();
+        $api = new DisputeController();
 
         foreach ($expired as $dispute) {
             $outcome = ((int) $dispute->panel_accepts > (int) $dispute->panel_rejects) ? 'accepted' : 'rejected';

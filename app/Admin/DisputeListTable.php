@@ -151,12 +151,10 @@ class DisputeListTable extends WP_List_Table
             $this->items
         ));
 
+        // NullTrustReadService::getVotesByIds() returns [] — admin sees empty vote_type column.
         $votes_by_id = [];
-        if (!empty($vote_ids)) {
-            $trustService = class_exists('\\BCC\\Core\\ServiceLocator') ? \BCC\Core\ServiceLocator::resolveTrustReadService() : null;
-            if ($trustService) {
-                $votes_by_id = $trustService->getVotesByIds($vote_ids);
-            }
+        if (!empty($vote_ids) && class_exists('\\BCC\\Core\\ServiceLocator')) {
+            $votes_by_id = \BCC\Core\ServiceLocator::resolveTrustReadService()->getVotesByIds($vote_ids);
         }
 
         // Merge vote_type onto each dispute row for column rendering.

@@ -5,7 +5,7 @@ namespace BCC\Disputes\Controllers;
 use BCC\Core\Contracts\TrustReadServiceInterface;
 use BCC\Core\ServiceLocator;
 use BCC\Disputes\Application\Disputes\ResolveDisputeCommand;
-use BCC\Disputes\Plugin;
+use BCC\Disputes\Application\Disputes\ResolveDisputeService;
 use BCC\Disputes\Repositories\DisputeRepository;
 use BCC\Disputes\Support\Logger;
 use WP_REST_Request;
@@ -213,9 +213,10 @@ class DisputeController
         }
 
         $disputes_table = DisputeRepository::disputes_table();
-        $service = class_exists('\\BCC\\Core\\ServiceLocator') ? ServiceLocator::resolveTrustReadService() : null;
 
-        if (!$service instanceof TrustReadServiceInterface) {
+        if (!class_exists('\\BCC\\Core\\ServiceLocator')
+            || !ServiceLocator::hasRealService(TrustReadServiceInterface::class)
+        ) {
             Logger::logFailure('trust_read_service_missing', [
                 'page_id' => $page_id,
                 'operation' => 'list_votes',
@@ -224,6 +225,7 @@ class DisputeController
             return $this->error('trust_service_unavailable', 'Trust service unavailable.', 503);
         }
 
+        $service = ServiceLocator::resolveTrustReadService();
         $votes = $service->getActiveVotesForPage($page_id);
         $voteIds = array_map(static fn(array $vote): int => (int) $vote['id'], $votes);
         $disputedVoteIds = [];
@@ -264,10 +266,13 @@ class DisputeController
         $disputeTable = DisputeRepository::disputes_table();
 
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT d.*, p.post_title as page_title, u.display_name as voter_name
+            "SELECT d.*, p.post_title AS page_title,
+                    u.display_name AS voter_name,
+                    r.display_name AS reporter_name
              FROM {$disputeTable} d
              LEFT JOIN {$wpdb->posts} p ON d.page_id = p.ID
              LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
+             LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
              WHERE d.reporter_id = %d
              ORDER BY d.created_at DESC",
             $userId
@@ -287,12 +292,16 @@ class DisputeController
         $panelTable   = DisputeRepository::panel_table();
 
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT d.*, pan.decision as my_decision, pan.voted_at as my_voted_at,
-                    p.post_title as page_title, u.display_name as voter_name
+            "SELECT d.*, pan.decision AS my_decision, pan.voted_at AS my_voted_at,
+                    pan.note AS my_note,
+                    p.post_title AS page_title,
+                    u.display_name AS voter_name,
+                    r.display_name AS reporter_name
              FROM {$panelTable} pan
              JOIN {$disputeTable} d ON d.id = pan.dispute_id
              LEFT JOIN {$wpdb->posts} p ON d.page_id = p.ID
              LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
+             LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
              WHERE pan.panelist_user_id = %d
                AND d.status IN ('pending','reviewing')
              ORDER BY d.created_at ASC",
@@ -438,7 +447,7 @@ class DisputeController
 
     public function resolve(int $dispute_id, int $vote_id, int $page_id, int $voter_id, int $reporter_id, string $outcome): void
     {
-        Plugin::instance()->resolve_dispute_service()->handle(new ResolveDisputeCommand(
+        (new ResolveDisputeService())->handle(new ResolveDisputeCommand(
             $dispute_id,
             $vote_id,
             $page_id,
@@ -452,15 +461,16 @@ class DisputeController
 
     private function getVote(int $vote_id): ?object
     {
-        $service = class_exists('\\BCC\\Core\\ServiceLocator') ? ServiceLocator::resolveTrustReadService() : null;
-
-        if (!$service instanceof TrustReadServiceInterface) {
+        if (!class_exists('\\BCC\\Core\\ServiceLocator')
+            || !ServiceLocator::hasRealService(TrustReadServiceInterface::class)
+        ) {
             Logger::logFailure('trust_read_service_missing', [
                 'vote_id' => $vote_id,
             ]);
             return null;
         }
 
+        $service = ServiceLocator::resolveTrustReadService();
         $vote = $service->getVoteById($vote_id);
 
         return $vote ? (object) $vote : null;
@@ -482,10 +492,10 @@ class DisputeController
     private function selectPanelists(int $reporter_id, int $voter_id): array
     {
         $needed = defined('BCC_DISPUTES_PANEL_SIZE') ? BCC_DISPUTES_PANEL_SIZE : 3;
-        $service = class_exists('\\BCC\\Core\\ServiceLocator') ? ServiceLocator::resolveTrustReadService() : null;
 
-
-        if (!$service instanceof TrustReadServiceInterface) {
+        if (!class_exists('\\BCC\\Core\\ServiceLocator')
+            || !ServiceLocator::hasRealService(TrustReadServiceInterface::class)
+        ) {
             Logger::logFailure('trust_read_service_missing', [
                 'reporter_id' => $reporter_id,
                 'voter_id' => $voter_id,
@@ -495,6 +505,7 @@ class DisputeController
             return [];
         }
 
+        $service = ServiceLocator::resolveTrustReadService();
         return $service->getEligiblePanelistUserIds([$reporter_id, $voter_id], $needed);
     }
 
@@ -519,20 +530,22 @@ class DisputeController
     private function formatDispute(object $d): array
     {
         return [
-            'id'           => (int) $d->id,
-            'vote_id'      => (int) $d->vote_id,
-            'page_id'      => (int) $d->page_id,
-            'page_title'   => $d->page_title ?? '',
-            'voter_name'   => $d->voter_name ?? 'Unknown',
-            'reason'       => $d->reason,
-            'evidence_url' => $d->evidence_url ?? '',
-            'status'       => $d->status,
-            'accepts'      => (int) $d->panel_accepts,
-            'rejects'      => (int) $d->panel_rejects,
-            'panel_size'   => (int) $d->panel_size,
-            'my_decision'  => $d->my_decision ?? null,
-            'created_at'   => $d->created_at,
-            'resolved_at'  => $d->resolved_at ?? null,
+            'id'            => (int) $d->id,
+            'vote_id'       => (int) $d->vote_id,
+            'page_id'       => (int) $d->page_id,
+            'page_title'    => $d->page_title ?? '',
+            'voter_name'    => $d->voter_name ?? 'Unknown',
+            'reporter_name' => $d->reporter_name ?? null,
+            'reason'        => $d->reason,
+            'evidence_url'  => $d->evidence_url ?? '',
+            'status'        => $d->status,
+            'accepts'       => (int) $d->panel_accepts,
+            'rejects'       => (int) $d->panel_rejects,
+            'panel_size'    => (int) $d->panel_size,
+            'my_decision'   => $d->my_decision ?? null,
+            'my_note'       => $d->my_note ?? null,
+            'created_at'    => $d->created_at,
+            'resolved_at'   => $d->resolved_at ?? null,
         ];
     }
 
@@ -660,21 +673,35 @@ class DisputeController
     }
 
     /**
-     * Throttle an action per user using transients.
+     * Throttle an action per user.
+     *
+     * Uses trust-engine's atomic RateLimiter when available (gains trust-tier
+     * awareness and Cloudflare-aware IP resolution). Falls back to simple
+     * transient-based throttle when trust-engine is inactive.
      *
      * @return WP_REST_Response|null  Error response if throttled, null if allowed.
      */
     private function throttle(string $action, int $user_id, int $cooldown_seconds = 60): ?WP_REST_Response
     {
         $key = "bcc_throttle_{$action}_{$user_id}";
-        if (get_transient($key)) {
+
+        if (class_exists('\\BCC\\Trust\\Security\\RateLimiter')) {
+            $allowed = \BCC\Trust\Security\RateLimiter::allowByKey($key, 1, $cooldown_seconds);
+        } else {
+            // Fallback: simple transient-based throttle
+            $allowed = !get_transient($key);
+            if ($allowed) {
+                set_transient($key, 1, $cooldown_seconds);
+            }
+        }
+
+        if (!$allowed) {
             return $this->error(
                 'rate_limited',
                 sprintf('Please wait %d seconds before trying again.', $cooldown_seconds),
                 429
             );
         }
-        set_transient($key, 1, $cooldown_seconds);
         return null;
     }
 

@@ -64,7 +64,7 @@ add_action('init', function () {
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 add_action('rest_api_init', function () {
-    \BCC\Disputes\Plugin::instance()->controller()->register_routes();
+    (new \BCC\Disputes\Controllers\DisputeController())->register_routes();
 });
 
 add_action('wp_enqueue_scripts', function () {

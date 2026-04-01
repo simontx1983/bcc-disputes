@@ -2,7 +2,7 @@
 
 namespace BCC\Disputes\Admin;
 
-use BCC\Disputes\Plugin;
+use BCC\Disputes\Controllers\DisputeController;
 use BCC\Disputes\Repositories\DisputeRepository;
 
 if (!defined('ABSPATH')) {
@@ -106,10 +106,10 @@ class DisputeAdmin
         }
 
         // Enrich with vote data from trust-engine via interface.
+        // NullTrustReadService::getVotesByIds() returns [] — admin sees "no vote data".
         $vote = null;
-        $trustService = class_exists('\\BCC\\Core\\ServiceLocator') ? \BCC\Core\ServiceLocator::resolveTrustReadService() : null;
-        if ($trustService && $dispute->vote_id) {
-            $votes = $trustService->getVotesByIds([(int) $dispute->vote_id]);
+        if (class_exists('\\BCC\\Core\\ServiceLocator') && $dispute->vote_id) {
+            $votes = \BCC\Core\ServiceLocator::resolveTrustReadService()->getVotesByIds([(int) $dispute->vote_id]);
             $vote  = $votes[(int) $dispute->vote_id] ?? null;
         }
 
@@ -318,7 +318,7 @@ class DisputeAdmin
             return;
         }
 
-        $api = Plugin::instance()->controller();
+        $api = new DisputeController();
 
         if ($action === 'accepted' || $action === 'rejected') {
             $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $action);

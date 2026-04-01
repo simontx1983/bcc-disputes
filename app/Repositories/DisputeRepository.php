@@ -2,6 +2,8 @@
 
 namespace BCC\Disputes\Repositories;
 
+use BCC\Core\DB\DB;
+
 if (!defined('ABSPATH')) {
     exit;
 }
@@ -10,20 +12,17 @@ class DisputeRepository
 {
     public static function disputes_table(): string
     {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_disputes';
+        return DB::table('disputes');
     }
 
     public static function panel_table(): string
     {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_dispute_panel';
+        return DB::table('dispute_panel');
     }
 
     public static function user_reports_table(): string
     {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_user_reports';
+        return DB::table('user_reports');
     }
 
     public static function install(): void
