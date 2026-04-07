@@ -44,6 +44,8 @@ if ( ! file_exists( $bcc_disputes_autoloader ) ) {
 }
 require_once $bcc_disputes_autoloader;
 
+require_once BCC_DISPUTES_PATH . 'includes/blocks.php';
+
 if (is_admin()) {
     \BCC\Disputes\Admin\DisputeAdmin::boot();
 }

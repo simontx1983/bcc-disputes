@@ -1,0 +1,23 @@
+{
+    "$schema": "https://schemas.wp.org/trunk/block.json",
+    "apiVersion": 3,
+    "name": "bcc-disputes/report-button",
+    "version": "1.1.0",
+    "title": "Report User Button",
+    "category": "bcc-disputes",
+    "icon": "flag",
+    "description": "Renders a Report User button for a specified user. Hidden if the viewer is not logged in or is the same user.",
+    "keywords": ["report", "user", "flag", "moderation"],
+    "textdomain": "bcc-disputes",
+    "attributes": {
+        "userId": {
+            "type": "number",
+            "default": 0
+        }
+    },
+    "supports": {
+        "html": false
+    },
+    "render": "file:./render.php",
+    "editorScript": "bcc-disputes-blocks-editor"
+}

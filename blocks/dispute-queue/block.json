@@ -1,0 +1,17 @@
+{
+    "$schema": "https://schemas.wp.org/trunk/block.json",
+    "apiVersion": 3,
+    "name": "bcc-disputes/dispute-queue",
+    "version": "1.1.0",
+    "title": "Dispute Panel Queue",
+    "category": "bcc-disputes",
+    "icon": "list-view",
+    "description": "Panelist review queue showing pending disputes assigned to the current Gold or Platinum member.",
+    "keywords": ["dispute", "panel", "queue", "review"],
+    "textdomain": "bcc-disputes",
+    "supports": {
+        "html": false
+    },
+    "render": "file:./render.php",
+    "editorScript": "bcc-disputes-blocks-editor"
+}
