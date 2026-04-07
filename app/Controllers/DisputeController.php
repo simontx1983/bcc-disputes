@@ -30,8 +30,9 @@ class DisputeController
             'permission_callback' => 'is_user_logged_in',
             'args'                => [
                 'vote_id'      => ['required' => true,  'type' => 'integer', 'minimum' => 1],
-                'reason'       => ['required' => true,  'type' => 'string',  'sanitize_callback' => 'sanitize_textarea_field', 'minLength' => 20],
-                'evidence_url' => ['required' => false, 'type' => 'string',  'sanitize_callback' => 'esc_url_raw'],
+                'reason'       => ['required' => true,  'type' => 'string',  'sanitize_callback' => 'sanitize_textarea_field', 'minLength' => 20, 'maxLength' => 1000,
+                                   'validate_callback' => function ($value) { return strlen(trim($value)) >= 20 ? true : new \WP_Error('too_short', 'Reason must be at least 20 non-whitespace characters.'); }],
+                'evidence_url' => ['required' => false, 'type' => 'string',  'sanitize_callback' => 'esc_url_raw', 'maxLength' => 2083],
             ],
         ]);
 
@@ -63,7 +64,7 @@ class DisputeController
             'permission_callback' => 'is_user_logged_in',
             'args'                => [
                 'decision' => ['required' => true, 'type' => 'string', 'enum' => ['accept', 'reject']],
-                'note'     => ['required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field'],
+                'note'     => ['required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field', 'maxLength' => 500],
             ],
         ]);
 
@@ -76,7 +77,7 @@ class DisputeController
                 'reported_user_id' => ['required' => true,  'type' => 'integer', 'minimum' => 1],
                 'reason_key'       => ['required' => true,  'type' => 'string',  'sanitize_callback' => 'sanitize_key',
                                        'enum'     => ['spam','harassment','fraud','misinformation','inappropriate','impersonation','other']],
-                'reason_detail'    => ['required' => false, 'type' => 'string',  'sanitize_callback' => 'sanitize_textarea_field',
+                'reason_detail'    => ['required' => false, 'type' => 'string',  'sanitize_callback' => 'sanitize_textarea_field', 'maxLength' => 1000,
                                        'default'  => ''],
             ],
         ]);
@@ -496,7 +497,10 @@ class DisputeController
             return \BCC\Core\Permissions\Permissions::owns_page($page_id, $user_id);
         }
         $post = get_post($page_id);
-        return $post && (int) $post->post_author === $user_id;
+        return $post
+            && $post->post_status === 'publish'
+            && in_array($post->post_type, ['page', 'bcc_page'], true)
+            && (int) $post->post_author === $user_id;
     }
 
     /**

@@ -114,7 +114,9 @@ add_action('peepso_user_profile_after_buttons', function ($user) {
     $profile_uid  = isset($user->id) ? (int) $user->id : (int) ($user->ID ?? 0);
     $current_uid  = get_current_user_id();
     if (!$profile_uid || $profile_uid === $current_uid) return;
-    $display_name = isset($user->display_name) ? $user->display_name : get_userdata($profile_uid)->display_name;
+    $ud = isset($user->display_name) ? $user : get_userdata($profile_uid);
+    $display_name = $ud ? ($ud->display_name ?? '') : '';
+    if (!$display_name) return;
     printf(
         '<button class="bcc-report-user-btn" data-user-id="%d" data-user-name="%s">⚑ %s</button>',
         $profile_uid,
