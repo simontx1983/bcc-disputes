@@ -40,7 +40,6 @@
         const pageId     = el.dataset.pageId;
         const voteList   = el.querySelector('#bcc-dispute-vote-list');
         const submitPanel = el.querySelector('#bcc-dispute-submit-panel');
-        const historyEl  = el.querySelector('#bcc-dispute-history');
         const historyList = el.querySelector('.bcc-dispute-history__list');
 
         let selectedVoteId   = null;
@@ -170,7 +169,7 @@
                     return;
                 }
                 listEl.innerHTML = disputes.map(d => `
-                    <div class="bcc-dispute-card" data-dispute-id="${d.id}">
+                    <div class="bcc-dispute-card" data-dispute-id="${escHtml(d.id)}">
                         <div class="bcc-dispute-card__meta">
                             <span class="bcc-dispute-card__page">${escHtml(d.page_title)}</span>
                             <span class="bcc-dispute-card__voter">· Vote by ${escHtml(d.voter_name)}</span>
@@ -183,8 +182,8 @@
                         ${d.my_decision
                             ? `<p class="bcc-dispute-already-voted">You voted: <strong>${escHtml(d.my_decision)}</strong></p>`
                             : `<div class="bcc-dispute-panel-actions">
-                                   <button class="bcc-dispute-btn bcc-dispute-btn--success bcc-dispute-btn--sm js-panel-vote" data-dispute="${d.id}" data-decision="accept">✓ Accept (remove vote)</button>
-                                   <button class="bcc-dispute-btn bcc-dispute-btn--secondary bcc-dispute-btn--sm js-panel-vote" data-dispute="${d.id}" data-decision="reject">✗ Reject (keep vote)</button>
+                                   <button class="bcc-dispute-btn bcc-dispute-btn--success bcc-dispute-btn--sm js-panel-vote" data-dispute="${escHtml(d.id)}" data-decision="accept">✓ Accept (remove vote)</button>
+                                   <button class="bcc-dispute-btn bcc-dispute-btn--secondary bcc-dispute-btn--sm js-panel-vote" data-dispute="${escHtml(d.id)}" data-decision="reject">✗ Reject (keep vote)</button>
                                </div>
                                <p class="bcc-dispute-status" aria-live="polite"></p>`
                         }

@@ -42,7 +42,7 @@ class DisputeRepository
             voter_id        BIGINT UNSIGNED NOT NULL,
             reason          VARCHAR(1000)   NOT NULL DEFAULT '',
             evidence_url    VARCHAR(2083)            DEFAULT NULL,
-            status          VARCHAR(20)     NOT NULL DEFAULT 'pending',
+            status          VARCHAR(20)     NOT NULL DEFAULT 'reviewing',
             panel_accepts   TINYINT UNSIGNED NOT NULL DEFAULT 0,
             panel_rejects   TINYINT UNSIGNED NOT NULL DEFAULT 0,
             panel_size      TINYINT UNSIGNED NOT NULL DEFAULT 5,

@@ -292,8 +292,7 @@ class DisputeController
         $panelTable   = DisputeRepository::panel_table();
 
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT d.*, pan.decision AS my_decision, pan.voted_at AS my_voted_at,
-                    pan.note AS my_note,
+            "SELECT d.*, pan.decision AS my_decision,
                     p.post_title AS page_title,
                     u.display_name AS voter_name,
                     r.display_name AS reporter_name
@@ -491,7 +490,7 @@ class DisputeController
      */
     private function selectPanelists(int $reporter_id, int $voter_id): array
     {
-        $needed = defined('BCC_DISPUTES_PANEL_SIZE') ? BCC_DISPUTES_PANEL_SIZE : 3;
+        $needed = BCC_DISPUTES_PANEL_SIZE;
 
         if (!class_exists('\\BCC\\Core\\ServiceLocator')
             || !ServiceLocator::hasRealService(TrustReadServiceInterface::class)
@@ -543,7 +542,6 @@ class DisputeController
             'rejects'       => (int) $d->panel_rejects,
             'panel_size'    => (int) $d->panel_size,
             'my_decision'   => $d->my_decision ?? null,
-            'my_note'       => $d->my_note ?? null,
             'created_at'    => $d->created_at,
             'resolved_at'   => $d->resolved_at ?? null,
         ];
@@ -587,11 +585,10 @@ class DisputeController
             'status'        => 'open',
         ], [ '%d', '%d', '%s', '%s', '%s' ] );
 
-        if ( ! $wpdb->insert_id ) {
+        $report_id = (int) $wpdb->insert_id;
+        if ( ! $report_id ) {
             return $this->error('db_error', 'Failed to submit report.', 500);
         }
-
-        $report_id = (int) $wpdb->insert_id;
 
         $this->emailReportedUser( $reported_user );
         $this->emailAdminReport( $report_id, $reporter_id, $reported_user, $reason_key, $reason_detail );

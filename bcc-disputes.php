@@ -100,7 +100,6 @@ add_action('wp_enqueue_scripts', function () {
         'restUrl'       => esc_url_raw(rest_url('bcc/v1/disputes')),
         'reportUserUrl' => esc_url_raw(rest_url('bcc/v1/report-user')),
         'nonce'         => wp_create_nonce('wp_rest'),
-        'userId'        => get_current_user_id(),
     ]);
 });
 
