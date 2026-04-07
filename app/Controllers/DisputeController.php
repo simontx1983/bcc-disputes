@@ -3,6 +3,8 @@
 namespace BCC\Disputes\Controllers;
 
 use BCC\Core\Contracts\TrustReadServiceInterface;
+use BCC\Core\Log\Logger as CoreLogger;
+use BCC\Core\Permissions\Permissions;
 use BCC\Core\ServiceLocator;
 use BCC\Disputes\Application\Disputes\ResolveDisputeCommand;
 use BCC\Disputes\Application\Disputes\ResolveDisputeService;
@@ -27,7 +29,7 @@ class DisputeController
         register_rest_route(self::NS, '/disputes', [
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => [$this, 'submit'],
-            'permission_callback' => 'is_user_logged_in',
+            'permission_callback' => function () { return is_user_logged_in() && Permissions::is_not_suspended(); },
             'args'                => [
                 'vote_id'      => ['required' => true,  'type' => 'integer', 'minimum' => 1],
                 'reason'       => ['required' => true,  'type' => 'string',  'sanitize_callback' => 'sanitize_textarea_field', 'minLength' => 20, 'maxLength' => 1000,
@@ -40,28 +42,28 @@ class DisputeController
         register_rest_route(self::NS, '/disputes/votes/(?P<page_id>\d+)', [
             'methods'             => WP_REST_Server::READABLE,
             'callback'            => [$this, 'list_votes'],
-            'permission_callback' => 'is_user_logged_in',
+            'permission_callback' => function () { return is_user_logged_in() && Permissions::is_not_suspended(); },
         ]);
 
         // Page owner's disputes
         register_rest_route(self::NS, '/disputes/mine', [
             'methods'             => WP_REST_Server::READABLE,
             'callback'            => [$this, 'mine'],
-            'permission_callback' => 'is_user_logged_in',
+            'permission_callback' => function () { return is_user_logged_in() && Permissions::is_not_suspended(); },
         ]);
 
         // Panelist queue
         register_rest_route(self::NS, '/disputes/panel', [
             'methods'             => WP_REST_Server::READABLE,
             'callback'            => [$this, 'panel_queue'],
-            'permission_callback' => 'is_user_logged_in',
+            'permission_callback' => function () { return is_user_logged_in() && Permissions::is_not_suspended(); },
         ]);
 
         // Cast panel vote
         register_rest_route(self::NS, '/disputes/(?P<id>\d+)/vote', [
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => [$this, 'cast_vote'],
-            'permission_callback' => 'is_user_logged_in',
+            'permission_callback' => function () { return is_user_logged_in() && Permissions::is_not_suspended(); },
             'args'                => [
                 'decision' => ['required' => true, 'type' => 'string', 'enum' => ['accept', 'reject']],
                 'note'     => ['required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field', 'maxLength' => 500],
@@ -72,7 +74,7 @@ class DisputeController
         register_rest_route(self::NS, '/report-user', [
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => [$this, 'report_user'],
-            'permission_callback' => 'is_user_logged_in',
+            'permission_callback' => function () { return is_user_logged_in() && Permissions::is_not_suspended(); },
             'args'                => [
                 'reported_user_id' => ['required' => true,  'type' => 'integer', 'minimum' => 1],
                 'reason_key'       => ['required' => true,  'type' => 'string',  'sanitize_callback' => 'sanitize_key',
@@ -191,6 +193,8 @@ class DisputeController
         foreach ($panelists as $uid) {
             $this->notifyPanelist($uid, $dispute_id, $page_id);
         }
+
+        CoreLogger::audit('dispute_submitted', ['dispute_id' => $dispute_id, 'user_id' => $current_user_id, 'vote_id' => $vote_id, 'panelists' => count($panelists)]);
 
         return rest_ensure_response([
             'dispute_id' => $dispute_id,
@@ -418,6 +422,8 @@ class DisputeController
 
         $wpdb->query('COMMIT');
 
+        CoreLogger::audit('dispute_vote_cast', ['dispute_id' => $dispute_id, 'user_id' => $userId, 'decision' => $decision]);
+
         // Resolve outside the transaction — but only the single voter that
         // held the lock at the moment majority was reached will reach here.
         // ResolveDisputeService has its own idempotency guard as a safety net.
@@ -611,6 +617,8 @@ class DisputeController
 
         $this->emailReportedUser( $reported_user );
         $this->emailAdminReport( $report_id, $reporter_id, $reported_user, $reason_key, $reason_detail );
+
+        CoreLogger::audit('user_reported', ['reporter' => $reporter_id, 'reported' => $reported_id, 'reason' => $reason_key]);
 
         return rest_ensure_response([
             'message' => 'Your report has been submitted. Our team will review it shortly.',
