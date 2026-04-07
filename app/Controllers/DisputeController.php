@@ -344,10 +344,22 @@ class DisputeController
             return $this->error('dispute_closed', 'This dispute is no longer open.', 410);
         }
 
-        // Transaction: vote recording + tally must be atomic.
-        // If the vote records but tally fails, the panelist can't revote and
-        // the dispute may never auto-resolve.
+        // Transaction: vote + tally + majority check must be atomic.
+        // SELECT FOR UPDATE on the dispute row serialises concurrent voters
+        // so only one can trigger resolve().
         $wpdb->query('START TRANSACTION');
+
+        // Lock the dispute row — concurrent voters block here until this
+        // transaction commits or rolls back.
+        $dispute = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$disputeTable} WHERE id = %d FOR UPDATE",
+            $dispute_id
+        ));
+
+        if (!$dispute || !in_array($dispute->status, ['pending', 'reviewing'], true)) {
+            $wpdb->query('ROLLBACK');
+            return $this->error('dispute_closed', 'This dispute is no longer open.', 410);
+        }
 
         // Atomic vote recording: UPDATE … WHERE decision IS NULL prevents double-voting
         // even under concurrent requests (the second request gets 0 affected rows).
@@ -372,7 +384,7 @@ class DisputeController
             return $this->error('already_voted', 'You have already voted on this dispute.', 409);
         }
 
-        // Atomic tally update — avoids race condition when two panelists vote simultaneously
+        // Atomic tally update
         $col = $decision === 'accept' ? 'panel_accepts' : 'panel_rejects';
         $tally_ok = $wpdb->query($wpdb->prepare(
             "UPDATE {$disputeTable} SET {$col} = {$col} + 1 WHERE id = %d",
@@ -390,11 +402,9 @@ class DisputeController
             return $this->error('db_error', 'Failed to update tally.', 500);
         }
 
-        $wpdb->query('COMMIT');
-
-        // Re-fetch for accurate majority check after atomic update
+        // Re-read tallies (still inside transaction / row lock)
         $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1",
+            "SELECT * FROM {$disputeTable} WHERE id = %d",
             $dispute_id
         ));
 
@@ -403,9 +413,14 @@ class DisputeController
         $total_voted = $accepts + $rejects;
         $panel_size  = (int) $dispute->panel_size;
         $majority    = (int) floor($panel_size / 2) + 1;
+        $should_resolve = ($accepts >= $majority || $rejects >= $majority || $total_voted >= $panel_size);
 
-        // Auto-resolve when all panelists have voted or a majority is reached
-        if ($accepts >= $majority || $rejects >= $majority || $total_voted >= $panel_size) {
+        $wpdb->query('COMMIT');
+
+        // Resolve outside the transaction — but only the single voter that
+        // held the lock at the moment majority was reached will reach here.
+        // ResolveDisputeService has its own idempotency guard as a safety net.
+        if ($should_resolve) {
             $final = $accepts > $rejects ? 'accepted' : 'rejected';
             $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $final);
         }
