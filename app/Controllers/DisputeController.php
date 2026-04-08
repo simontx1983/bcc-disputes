@@ -448,7 +448,9 @@ class DisputeController
 
         // Re-read tallies (still inside transaction / row lock)
         $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$disputeTable} WHERE id = %d",
+            "SELECT id, status, panel_accepts, panel_rejects, panel_size,
+                    vote_id, page_id, voter_id, reporter_id
+             FROM {$disputeTable} WHERE id = %d",
             $dispute_id
         ));
 
@@ -488,7 +490,7 @@ class DisputeController
         $decision   = $req->get_param('decision'); // 'accepted' | 'rejected'
 
         $disputeTable = DisputeRepository::disputes_table();
-        $dispute      = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1", $dispute_id));
+        $dispute      = $wpdb->get_row($wpdb->prepare("SELECT id, status, vote_id, page_id, voter_id, reporter_id FROM {$disputeTable} WHERE id = %d LIMIT 1", $dispute_id));
 
         if (!$dispute) {
             return $this->error('not_found', 'Dispute not found.', 404);

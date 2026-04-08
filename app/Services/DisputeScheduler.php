@@ -43,7 +43,8 @@ class DisputeScheduler
         $cutoff       = date('Y-m-d H:i:s', current_time('timestamp') - (BCC_DISPUTES_TTL_DAYS * DAY_IN_SECONDS));
 
         $expired = $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM {$disputeTable}
+            "SELECT id, panel_accepts, panel_rejects, vote_id, page_id, voter_id, reporter_id
+             FROM {$disputeTable}
              WHERE status IN ('pending','reviewing')
                AND created_at <= %s
              ORDER BY created_at ASC
