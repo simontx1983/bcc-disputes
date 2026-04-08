@@ -270,8 +270,20 @@ class DisputeController
         $userId       = get_current_user_id();
         $disputeTable = DisputeRepository::disputes_table();
 
+        $page     = max(1, (int) $req->get_param('page'));
+        $per_page = min(100, max(1, (int) ($req->get_param('per_page') ?: 20)));
+        $offset   = ($page - 1) * $per_page;
+
+        $total = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$disputeTable} WHERE reporter_id = %d",
+            $userId
+        ));
+
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT d.*, p.post_title AS page_title,
+            "SELECT d.id, d.vote_id, d.page_id, d.reason, d.evidence_url, d.status,
+                    d.panel_accepts, d.panel_rejects, d.panel_size,
+                    d.voter_id, d.reporter_id, d.created_at, d.resolved_at,
+                    p.post_title AS page_title,
                     u.display_name AS voter_name,
                     r.display_name AS reporter_name
              FROM {$disputeTable} d
@@ -279,11 +291,15 @@ class DisputeController
              LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
              LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
              WHERE d.reporter_id = %d
-             ORDER BY d.created_at DESC",
-            $userId
+             ORDER BY d.created_at DESC
+             LIMIT %d OFFSET %d",
+            $userId, $per_page, $offset
         ));
 
-        return rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
+        $response = rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
+        $response->header('X-WP-Total', (string) $total);
+        $response->header('X-WP-TotalPages', (string) max(1, (int) ceil($total / $per_page)));
+        return $response;
     }
 
     // ── Panel queue ───────────────────────────────────────────────────────────
@@ -296,8 +312,23 @@ class DisputeController
         $disputeTable = DisputeRepository::disputes_table();
         $panelTable   = DisputeRepository::panel_table();
 
+        $page     = max(1, (int) $req->get_param('page'));
+        $per_page = min(100, max(1, (int) ($req->get_param('per_page') ?: 20)));
+        $offset   = ($page - 1) * $per_page;
+
+        $total = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*)
+             FROM {$panelTable} pan
+             JOIN {$disputeTable} d ON d.id = pan.dispute_id
+             WHERE pan.panelist_user_id = %d AND d.status IN ('pending','reviewing')",
+            $userId
+        ));
+
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT d.*, pan.decision AS my_decision,
+            "SELECT d.id, d.vote_id, d.page_id, d.reason, d.evidence_url, d.status,
+                    d.panel_accepts, d.panel_rejects, d.panel_size,
+                    d.voter_id, d.reporter_id, d.created_at, d.resolved_at,
+                    pan.decision AS my_decision,
                     p.post_title AS page_title,
                     u.display_name AS voter_name,
                     r.display_name AS reporter_name
@@ -308,11 +339,15 @@ class DisputeController
              LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
              WHERE pan.panelist_user_id = %d
                AND d.status IN ('pending','reviewing')
-             ORDER BY d.created_at ASC",
-            $userId
+             ORDER BY d.created_at ASC
+             LIMIT %d OFFSET %d",
+            $userId, $per_page, $offset
         ));
 
-        return rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
+        $response = rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
+        $response->header('X-WP-Total', (string) $total);
+        $response->header('X-WP-TotalPages', (string) max(1, (int) ceil($total / $per_page)));
+        return $response;
     }
 
     // ── Cast panel vote ───────────────────────────────────────────────────────
@@ -331,7 +366,7 @@ class DisputeController
 
         // Confirm this user is assigned to this dispute
         $assignment = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$panelTable} WHERE dispute_id = %d AND panelist_user_id = %d LIMIT 1",
+            "SELECT id, decision FROM {$panelTable} WHERE dispute_id = %d AND panelist_user_id = %d LIMIT 1",
             $dispute_id, $userId
         ));
         if (!$assignment) {
@@ -342,7 +377,9 @@ class DisputeController
         }
 
         $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1",
+            "SELECT id, status, vote_id, page_id, voter_id, reporter_id,
+                    panel_accepts, panel_rejects, panel_size
+             FROM {$disputeTable} WHERE id = %d LIMIT 1",
             $dispute_id
         ));
         if (!$dispute || !in_array($dispute->status, ['pending', 'reviewing'], true)) {
@@ -357,7 +394,9 @@ class DisputeController
         // Lock the dispute row — concurrent voters block here until this
         // transaction commits or rolls back.
         $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$disputeTable} WHERE id = %d FOR UPDATE",
+            "SELECT id, status, vote_id, page_id, voter_id, reporter_id,
+                    panel_accepts, panel_rejects, panel_size
+             FROM {$disputeTable} WHERE id = %d FOR UPDATE",
             $dispute_id
         ));
 
