@@ -98,3 +98,45 @@ All routes require authentication. Namespace: `bcc/v1`.
 - All DB table names via `BCC\Core\DB\DB::table()`, never hardcoded prefixes
 - Bridge files in `includes/` are backward-compat only — never add new logic there
 - Boot order in main file: constants → autoloader → bridges → schema → hooks
+
+## Architecture Guardrails (ENFORCED)
+
+These rules are non-negotiable. Run `bash scripts/arch-guardrails.sh` before committing.
+
+### Data Access Rules
+
+1. **Repository-only DB access**: All `$wpdb` usage must be inside `app/Repositories/` classes. No exceptions in controllers, services, admin classes, or templates. Allowed exceptions: schema files (`includes/database/`), migrations, `uninstall.php`.
+2. **No SELECT ***: Every query must use explicit column lists. Define a `private const COLUMNS` in each repository matching the table schema.
+3. **No template queries**: Templates and render files (`templates/`, `includes/admin/`, `includes/partials/`) must receive data from controllers/services. Zero `$wpdb` in templates.
+4. **Bounded queries**: Every SELECT must have LIMIT, or query by unique key (WHERE id = %d), or use IN() with a finite input set, or be an aggregate (COUNT/SUM/AVG).
+5. **Cache read-heavy paths**: Repositories with 4+ read methods should use `wp_cache_get/set` with a dedicated CACHE_GROUP constant and TTL. Write methods must invalidate affected cache keys.
+
+### Caching Pattern
+
+```php
+private const CACHE_GROUP = 'bcc_<plugin>';
+private const CACHE_TTL   = 60; // seconds
+
+// Read: check cache first
+$cached = wp_cache_get($key, self::CACHE_GROUP);
+if ($cached !== false) return $cached;
+// ... query DB ...
+wp_cache_set($key, $result, self::CACHE_GROUP, self::CACHE_TTL);
+
+// Write: invalidate after mutation
+wp_cache_delete($key, self::CACHE_GROUP);
+// For wildcard invalidation, use generation counters (wp_cache_incr)
+```
+
+### Running Guardrails
+
+```bash
+# Scan this plugin only
+bash scripts/arch-guardrails.sh bcc-disputes
+
+# Scan all plugins
+bash scripts/arch-guardrails.sh
+
+# Machine-readable JSON output
+bash scripts/arch-guardrails.sh --json
+```

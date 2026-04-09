@@ -40,6 +40,16 @@
             "type": "command",
             "command": "cmd /c node %CLAUDE_PROJECT_DIR%/.claude/helpers/php-lint-hook.cjs",
             "timeout": 8000
+          },
+          {
+            "type": "command",
+            "command": "cmd /c node %CLAUDE_PROJECT_DIR%/.claude/helpers/block-render-guard.cjs",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "cmd /c node %CLAUDE_PROJECT_DIR%/.claude/helpers/cross-plugin-contract-guard.cjs",
+            "timeout": 8000
           }
         ]
       },

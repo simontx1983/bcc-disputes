@@ -6,14 +6,13 @@ use BCC\Core\Contracts\TrustReadServiceInterface;
 use BCC\Core\Log\Logger as CoreLogger;
 use BCC\Core\Permissions\Permissions;
 use BCC\Core\ServiceLocator;
-use BCC\Disputes\Application\Disputes\ResolveDisputeCommand;
 use BCC\Disputes\Application\Disputes\ResolveDisputeService;
 use BCC\Disputes\Repositories\DisputeRepository;
+use BCC\Disputes\Services\DisputeNotificationService;
 use BCC\Disputes\Support\Logger;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_REST_Server;
-use WP_User;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -99,8 +98,6 @@ class DisputeController
 
     public function submit(WP_REST_Request $req): WP_REST_Response
     {
-        global $wpdb;
-
         $current_user_id = get_current_user_id();
 
         $throttled = $this->throttle('dispute_submit', $current_user_id, 60);
@@ -120,7 +117,7 @@ class DisputeController
         $voter_id = (int) $vote->voter_user_id;
 
         // Only page owner can dispute
-        if (!$this->isPageOwner($page_id, $current_user_id)) {
+        if (!Permissions::owns_page($page_id, $current_user_id)) {
             return $this->error('not_page_owner', 'Only the page owner can dispute votes.', 403);
         }
 
@@ -129,24 +126,20 @@ class DisputeController
             return $this->error('cannot_self_dispute', 'You cannot dispute your own vote.', 400);
         }
 
-        $disputeTable = DisputeRepository::disputes_table();
-        $panelTable   = DisputeRepository::panel_table();
-
         // One active dispute per vote
-        $existing = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$disputeTable} WHERE vote_id = %d AND status IN ('pending','reviewing') LIMIT 1",
-            $vote_id
-        ));
-        if ($existing) {
+        if (DisputeRepository::hasActiveDisputeForVote($vote_id)) {
             return $this->error('already_disputed', 'This vote already has an active dispute.', 409);
+        }
+
+        // Max 3 disputes per page per 30 days — prevents brute-force dispute spam.
+        if (DisputeRepository::countRecentDisputesForPage($page_id, 30) >= 3) {
+            return $this->error('dispute_limit_reached', 'This page has reached its dispute limit. Please try again later.', 429);
         }
 
         // Insert dispute + panelists atomically
         $panelists = $this->selectPanelists($current_user_id, $voter_id);
 
-        $wpdb->query('START TRANSACTION');
-
-        $wpdb->insert($disputeTable, [
+        $result = DisputeRepository::createDisputeWithPanel([
             'vote_id'      => $vote_id,
             'page_id'      => $page_id,
             'reporter_id'  => $current_user_id,
@@ -155,43 +148,28 @@ class DisputeController
             'evidence_url' => $evidence_url,
             'status'       => 'reviewing',
             'panel_size'   => BCC_DISPUTES_PANEL_SIZE,
-        ], ['%d', '%d', '%d', '%d', '%s', '%s', '%s', '%d']);
+        ], $panelists);
 
-        $dispute_id = $wpdb->insert_id;
+        $dispute_id = $result['id'];
 
         if (!$dispute_id) {
-            $wpdb->query('ROLLBACK');
+            // Atomic limit check inside transaction returned this error
+            if ($result['db_error'] === 'dispute_limit_reached') {
+                return $this->error('dispute_limit_reached', 'This page has reached its dispute limit. Please try again later.', 429);
+            }
+            if ($result['failed_panelist'] !== null) {
+                Logger::logFailure('panel_insert_failed', [
+                    'panelist_id' => $result['failed_panelist'],
+                    'db_error'    => $result['db_error'],
+                ]);
+                return $this->error('db_error', 'Failed to assign panelists.', 500);
+            }
             return $this->error('db_error', 'Failed to create dispute.', 500);
         }
 
-        $panel_ok = true;
+        // Notifications queued async — never block the REST response with SMTP.
         foreach ($panelists as $uid) {
-            $wpdb->insert($panelTable, [
-                'dispute_id'       => $dispute_id,
-                'panelist_user_id' => $uid,
-            ], ['%d', '%d']);
-
-            if ($wpdb->last_error) {
-                Logger::logFailure('panel_insert_failed', [
-                    'dispute_id'  => $dispute_id,
-                    'panelist_id' => $uid,
-                    'db_error'    => $wpdb->last_error,
-                ]);
-                $panel_ok = false;
-                break;
-            }
-        }
-
-        if (!$panel_ok) {
-            $wpdb->query('ROLLBACK');
-            return $this->error('db_error', 'Failed to assign panelists.', 500);
-        }
-
-        $wpdb->query('COMMIT');
-
-        // Notifications sent after commit — outside the transaction
-        foreach ($panelists as $uid) {
-            $this->notifyPanelist($uid, $dispute_id, $page_id);
+            DisputeNotificationService::enqueueAsync('bcc_disputes_notify_panelist', [$uid, $dispute_id, $page_id]);
         }
 
         CoreLogger::audit('dispute_submitted', ['dispute_id' => $dispute_id, 'user_id' => $current_user_id, 'vote_id' => $vote_id, 'panelists' => count($panelists)]);
@@ -207,21 +185,14 @@ class DisputeController
 
     public function list_votes(WP_REST_Request $req): WP_REST_Response
     {
-        global $wpdb;
-
-
         $page_id         = (int) $req->get_param('page_id');
         $current_user_id = get_current_user_id();
 
-        if (!$this->isPageOwner($page_id, $current_user_id) && !current_user_can('manage_options')) {
+        if (!Permissions::owns_page($page_id, $current_user_id) && !current_user_can('manage_options')) {
             return $this->error('forbidden', 'Access denied.', 403);
         }
 
-        $disputes_table = DisputeRepository::disputes_table();
-
-        if (!class_exists('\\BCC\\Core\\ServiceLocator')
-            || !ServiceLocator::hasRealService(TrustReadServiceInterface::class)
-        ) {
+        if (!ServiceLocator::hasRealService(TrustReadServiceInterface::class)) {
             Logger::logFailure('trust_read_service_missing', [
                 'page_id' => $page_id,
                 'operation' => 'list_votes',
@@ -230,25 +201,19 @@ class DisputeController
             return $this->error('trust_service_unavailable', 'Trust service unavailable.', 503);
         }
 
-        $service = ServiceLocator::resolveTrustReadService();
-        $votes = $service->getActiveVotesForPage($page_id);
+        $service  = ServiceLocator::resolveTrustReadService();
+        $page     = max(1, (int) $req->get_param('page'));
+        $per_page = min(100, max(1, (int) ($req->get_param('per_page') ?: 50)));
+        $offset   = ($page - 1) * $per_page;
+
+        // Pagination pushed into the DB query — only the requested page is fetched.
+        $total = $service->countActiveVotesForPage($page_id);
+        $votes = $service->getActiveVotesForPage($page_id, $per_page, $offset);
+
         $voteIds = array_map(static fn(array $vote): int => (int) $vote['id'], $votes);
-        $disputedVoteIds = [];
+        $disputedVoteIds = DisputeRepository::getDisputedVoteIds($voteIds);
 
-        if (!empty($voteIds)) {
-            $placeholders = implode(',', array_fill(0, count($voteIds), '%d'));
-            $rows = $wpdb->get_col($wpdb->prepare(
-                "SELECT DISTINCT vote_id
-                 FROM {$disputes_table}
-                 WHERE vote_id IN ({$placeholders})
-                   AND status IN ('pending','reviewing','accepted')",
-                ...$voteIds
-            ));
-
-            $disputedVoteIds = array_fill_keys(array_map('intval', $rows), true);
-        }
-
-        return rest_ensure_response(array_map(function (array $vote) use ($disputedVoteIds) {
+        $response = rest_ensure_response(array_map(function (array $vote) use ($disputedVoteIds) {
             return [
                 'id' => (int) $vote['id'],
                 'voter_name' => $vote['voter_name'] ?? 'Unknown',
@@ -259,42 +224,22 @@ class DisputeController
                 'already_disputed' => isset($disputedVoteIds[(int) $vote['id']]),
             ];
         }, $votes));
+        $response->header('X-WP-Total', (string) $total);
+        $response->header('X-WP-TotalPages', (string) max(1, (int) ceil($total / $per_page)));
+        return $response;
     }
 
     // ── My disputes ───────────────────────────────────────────────────────────
 
     public function mine(WP_REST_Request $req): WP_REST_Response
     {
-        global $wpdb;
-
-        $userId       = get_current_user_id();
-        $disputeTable = DisputeRepository::disputes_table();
-
+        $userId   = get_current_user_id();
         $page     = max(1, (int) $req->get_param('page'));
         $per_page = min(100, max(1, (int) ($req->get_param('per_page') ?: 20)));
         $offset   = ($page - 1) * $per_page;
 
-        $total = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$disputeTable} WHERE reporter_id = %d",
-            $userId
-        ));
-
-        $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT d.id, d.vote_id, d.page_id, d.reason, d.evidence_url, d.status,
-                    d.panel_accepts, d.panel_rejects, d.panel_size,
-                    d.voter_id, d.reporter_id, d.created_at, d.resolved_at,
-                    p.post_title AS page_title,
-                    u.display_name AS voter_name,
-                    r.display_name AS reporter_name
-             FROM {$disputeTable} d
-             LEFT JOIN {$wpdb->posts} p ON d.page_id = p.ID
-             LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
-             LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
-             WHERE d.reporter_id = %d
-             ORDER BY d.created_at DESC
-             LIMIT %d OFFSET %d",
-            $userId, $per_page, $offset
-        ));
+        $total = DisputeRepository::countByReporter($userId);
+        $rows  = DisputeRepository::getByReporterPaginated($userId, $per_page, $offset);
 
         $response = rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
         $response->header('X-WP-Total', (string) $total);
@@ -306,43 +251,13 @@ class DisputeController
 
     public function panel_queue(WP_REST_Request $req): WP_REST_Response
     {
-        global $wpdb;
-
-        $userId       = get_current_user_id();
-        $disputeTable = DisputeRepository::disputes_table();
-        $panelTable   = DisputeRepository::panel_table();
-
+        $userId   = get_current_user_id();
         $page     = max(1, (int) $req->get_param('page'));
         $per_page = min(100, max(1, (int) ($req->get_param('per_page') ?: 20)));
         $offset   = ($page - 1) * $per_page;
 
-        $total = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*)
-             FROM {$panelTable} pan
-             JOIN {$disputeTable} d ON d.id = pan.dispute_id
-             WHERE pan.panelist_user_id = %d AND d.status IN ('pending','reviewing')",
-            $userId
-        ));
-
-        $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT d.id, d.vote_id, d.page_id, d.reason, d.evidence_url, d.status,
-                    d.panel_accepts, d.panel_rejects, d.panel_size,
-                    d.voter_id, d.reporter_id, d.created_at, d.resolved_at,
-                    pan.decision AS my_decision,
-                    p.post_title AS page_title,
-                    u.display_name AS voter_name,
-                    r.display_name AS reporter_name
-             FROM {$panelTable} pan
-             JOIN {$disputeTable} d ON d.id = pan.dispute_id
-             LEFT JOIN {$wpdb->posts} p ON d.page_id = p.ID
-             LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
-             LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
-             WHERE pan.panelist_user_id = %d
-               AND d.status IN ('pending','reviewing')
-             ORDER BY d.created_at ASC
-             LIMIT %d OFFSET %d",
-            $userId, $per_page, $offset
-        ));
+        $total = DisputeRepository::countPanelQueueForUser($userId);
+        $rows  = DisputeRepository::getPanelQueueForUser($userId, $per_page, $offset);
 
         $response = rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
         $response->header('X-WP-Total', (string) $total);
@@ -354,21 +269,17 @@ class DisputeController
 
     public function cast_vote(WP_REST_Request $req): WP_REST_Response
     {
-        global $wpdb;
-
         $dispute_id = (int) $req->get_param('id');
         $decision   = $req->get_param('decision'); // 'accept' | 'reject'
         $note       = $req->get_param('note') ?? '';
         $userId     = get_current_user_id();
 
-        $disputeTable = DisputeRepository::disputes_table();
-        $panelTable   = DisputeRepository::panel_table();
+        if (!in_array($decision, ['accept', 'reject'], true)) {
+            return $this->error('invalid_decision', 'Decision must be accept or reject.', 400);
+        }
 
         // Confirm this user is assigned to this dispute
-        $assignment = $wpdb->get_row($wpdb->prepare(
-            "SELECT id, decision FROM {$panelTable} WHERE dispute_id = %d AND panelist_user_id = %d LIMIT 1",
-            $dispute_id, $userId
-        ));
+        $assignment = DisputeRepository::getPanelAssignment($dispute_id, $userId);
         if (!$assignment) {
             return $this->error('not_assigned', 'You are not assigned to this dispute.', 403);
         }
@@ -376,98 +287,39 @@ class DisputeController
             return $this->error('already_voted', 'You have already voted on this dispute.', 409);
         }
 
-        $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT id, status, vote_id, page_id, voter_id, reporter_id,
-                    panel_accepts, panel_rejects, panel_size
-             FROM {$disputeTable} WHERE id = %d LIMIT 1",
-            $dispute_id
-        ));
+        $dispute = DisputeRepository::getDisputeById($dispute_id);
         if (!$dispute || !in_array($dispute->status, ['pending', 'reviewing'], true)) {
             return $this->error('dispute_closed', 'This dispute is no longer open.', 410);
         }
 
-        // Transaction: vote + tally + majority check must be atomic.
-        // SELECT FOR UPDATE on the dispute row serialises concurrent voters
-        // so only one can trigger resolve().
-        $wpdb->query('START TRANSACTION');
+        // Atomic transaction: lock → vote → tally → re-read (all in repository).
+        $result = DisputeRepository::castPanelVoteAtomic($dispute_id, $userId, $decision, $note);
 
-        // Lock the dispute row — concurrent voters block here until this
-        // transaction commits or rolls back.
-        $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT id, status, vote_id, page_id, voter_id, reporter_id,
-                    panel_accepts, panel_rejects, panel_size
-             FROM {$disputeTable} WHERE id = %d FOR UPDATE",
-            $dispute_id
-        ));
-
-        if (!$dispute || !in_array($dispute->status, ['pending', 'reviewing'], true)) {
-            $wpdb->query('ROLLBACK');
-            return $this->error('dispute_closed', 'This dispute is no longer open.', 410);
+        if ($result['status'] !== 'success') {
+            if (isset($result['db_error'])) {
+                Logger::logFailure('cast_vote_rollback', [
+                    'dispute_id' => $dispute_id,
+                    'user_id'    => $userId,
+                    'step'       => $result['step'] ?? 'unknown',
+                    'db_error'   => $result['db_error'],
+                ]);
+            }
+            return $this->error($result['code'], $result['message'], $result['http']);
         }
 
-        // Atomic vote recording: UPDATE … WHERE decision IS NULL prevents double-voting
-        // even under concurrent requests (the second request gets 0 affected rows).
-        $voted = $wpdb->query($wpdb->prepare(
-            "UPDATE {$panelTable} SET decision = %s, note = %s, voted_at = %s
-             WHERE dispute_id = %d AND panelist_user_id = %d AND decision IS NULL",
-            $decision, $note, current_time('mysql'), $dispute_id, $userId
-        ));
-
-        if ($voted === false) {
-            $wpdb->query('ROLLBACK');
-            Logger::logFailure('cast_vote_rollback', [
-                'dispute_id' => $dispute_id,
-                'user_id'    => $userId,
-                'step'       => 'panel_vote_update',
-                'db_error'   => $wpdb->last_error,
-            ]);
-            return $this->error('db_error', 'Failed to record vote.', 500);
-        }
-        if ($voted === 0) {
-            $wpdb->query('ROLLBACK');
-            return $this->error('already_voted', 'You have already voted on this dispute.', 409);
-        }
-
-        // Atomic tally update
-        $col = $decision === 'accept' ? 'panel_accepts' : 'panel_rejects';
-        $tally_ok = $wpdb->query($wpdb->prepare(
-            "UPDATE {$disputeTable} SET {$col} = {$col} + 1 WHERE id = %d",
-            $dispute_id
-        ));
-
-        if ($tally_ok === false) {
-            $wpdb->query('ROLLBACK');
-            Logger::logFailure('cast_vote_rollback', [
-                'dispute_id' => $dispute_id,
-                'user_id'    => $userId,
-                'step'       => 'tally_increment',
-                'db_error'   => $wpdb->last_error,
-            ]);
-            return $this->error('db_error', 'Failed to update tally.', 500);
-        }
-
-        // Re-read tallies (still inside transaction / row lock)
-        $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT id, status, panel_accepts, panel_rejects, panel_size,
-                    vote_id, page_id, voter_id, reporter_id
-             FROM {$disputeTable} WHERE id = %d",
-            $dispute_id
-        ));
-
-        $accepts     = (int) $dispute->panel_accepts;
-        $rejects     = (int) $dispute->panel_rejects;
+        $accepts    = $result['accepts'];
+        $rejects    = $result['rejects'];
+        $dispute    = $result['dispute'];
         $total_voted = $accepts + $rejects;
         $panel_size  = (int) $dispute->panel_size;
         $majority    = (int) floor($panel_size / 2) + 1;
         $should_resolve = ($accepts >= $majority || $rejects >= $majority || $total_voted >= $panel_size);
 
-        $wpdb->query('COMMIT');
-
         CoreLogger::audit('dispute_vote_cast', ['dispute_id' => $dispute_id, 'user_id' => $userId, 'decision' => $decision]);
 
-        // Resolve outside the transaction — but only the single voter that
-        // held the lock at the moment majority was reached will reach here.
-        // ResolveDisputeService has its own idempotency guard as a safety net.
+        // Resolve outside the transaction. Multiple concurrent voters may
+        // evaluate $should_resolve = true; ResolveDisputeService is the
+        // authoritative idempotency gate (WHERE status IN ('pending','reviewing')).
         if ($should_resolve) {
             $final = $accepts > $rejects ? 'accepted' : 'rejected';
             $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $final);
@@ -484,13 +336,14 @@ class DisputeController
 
     public function force_resolve(WP_REST_Request $req): WP_REST_Response
     {
-        global $wpdb;
-
         $dispute_id = (int) $req->get_param('id');
         $decision   = $req->get_param('decision'); // 'accepted' | 'rejected'
 
-        $disputeTable = DisputeRepository::disputes_table();
-        $dispute      = $wpdb->get_row($wpdb->prepare("SELECT id, status, vote_id, page_id, voter_id, reporter_id FROM {$disputeTable} WHERE id = %d LIMIT 1", $dispute_id));
+        if (!in_array($decision, ['accepted', 'rejected'], true)) {
+            return $this->error('invalid_decision', 'Decision must be accepted or rejected.', 400);
+        }
+
+        $dispute = DisputeRepository::getDisputeById($dispute_id);
 
         if (!$dispute) {
             return $this->error('not_found', 'Dispute not found.', 404);
@@ -500,32 +353,27 @@ class DisputeController
             return $this->error('already_resolved', 'This dispute has already been resolved.', 409);
         }
 
-        $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $decision);
+        $success = $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $decision);
+
+        if (!$success) {
+            return $this->error('resolution_failed', 'Dispute could not be resolved. Trust engine may be unavailable.', 503);
+        }
 
         return rest_ensure_response(['message' => 'Dispute resolved as ' . $decision . '.']);
     }
 
     // ── Resolution logic ──────────────────────────────────────────────────────
 
-    public function resolve(int $dispute_id, int $vote_id, int $page_id, int $voter_id, int $reporter_id, string $outcome): void
+    public function resolve(int $dispute_id, int $vote_id, int $page_id, int $voter_id, int $reporter_id, string $outcome): bool
     {
-        (new ResolveDisputeService())->handle(new ResolveDisputeCommand(
-            $dispute_id,
-            $vote_id,
-            $page_id,
-            $voter_id,
-            $reporter_id,
-            $outcome
-        ));
+        return (new ResolveDisputeService())->handle($dispute_id, $vote_id, $page_id, $voter_id, $reporter_id, $outcome);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private function getVote(int $vote_id): ?object
     {
-        if (!class_exists('\\BCC\\Core\\ServiceLocator')
-            || !ServiceLocator::hasRealService(TrustReadServiceInterface::class)
-        ) {
+        if (!ServiceLocator::hasRealService(TrustReadServiceInterface::class)) {
             Logger::logFailure('trust_read_service_missing', [
                 'vote_id' => $vote_id,
             ]);
@@ -538,18 +386,6 @@ class DisputeController
         return $vote ? (object) $vote : null;
     }
 
-    private function isPageOwner(int $page_id, int $user_id): bool
-    {
-        if (class_exists('BCC\\Core\\Permissions\\Permissions')) {
-            return \BCC\Core\Permissions\Permissions::owns_page($page_id, $user_id);
-        }
-        $post = get_post($page_id);
-        return $post
-            && $post->post_status === 'publish'
-            && in_array($post->post_type, ['page', 'bcc_page'], true)
-            && (int) $post->post_author === $user_id;
-    }
-
     /**
      * Pick up to BCC_DISPUTES_PANEL_SIZE Gold/Platinum users,
      * excluding the reporter and the voter.
@@ -558,9 +394,7 @@ class DisputeController
     {
         $needed = BCC_DISPUTES_PANEL_SIZE;
 
-        if (!class_exists('\\BCC\\Core\\ServiceLocator')
-            || !ServiceLocator::hasRealService(TrustReadServiceInterface::class)
-        ) {
+        if (!ServiceLocator::hasRealService(TrustReadServiceInterface::class)) {
             Logger::logFailure('trust_read_service_missing', [
                 'reporter_id' => $reporter_id,
                 'voter_id' => $voter_id,
@@ -572,24 +406,6 @@ class DisputeController
 
         $service = ServiceLocator::resolveTrustReadService();
         return $service->getEligiblePanelistUserIds([$reporter_id, $voter_id], $needed);
-    }
-
-    private function notifyPanelist(int $uid, int $dispute_id, int $page_id): void
-    {
-        $user = get_userdata($uid);
-        if (!$user || !$user->user_email) {
-            return;
-        }
-        $page = get_post($page_id);
-        $subject = '[BCC] You have been selected as a dispute panelist';
-        $body = sprintf(
-            "Hello %s,\n\nA dispute has been filed against a vote on \"%s\". As a Gold/Platinum member, you've been selected to help review it.\n\nLog in and visit your dispute queue to cast your vote within %d days.\n\nDispute ID: #%d\n",
-            $user->display_name,
-            $page ? $page->post_title : "a project page",
-            BCC_DISPUTES_TTL_DAYS,
-            $dispute_id
-        );
-        wp_mail($user->user_email, $subject, $body);
     }
 
     private function formatDispute(object $d): array
@@ -617,8 +433,6 @@ class DisputeController
 
     public function report_user( WP_REST_Request $req ): WP_REST_Response
     {
-        global $wpdb;
-
         $reporter_id      = get_current_user_id();
 
         $throttled = $this->throttle('report_user', $reporter_id, 60);
@@ -641,100 +455,20 @@ class DisputeController
             return $this->error('detail_required', 'Please provide at least 10 characters describing your reason.', 400);
         }
 
-        $reportTable = DisputeRepository::user_reports_table();
-
-        $wpdb->insert( $reportTable, [
-            'reported_id'   => $reported_id,
-            'reporter_id'   => $reporter_id,
-            'reason_key'    => $reason_key,
-            'reason_detail' => $reason_detail,
-            'status'        => 'open',
-        ], [ '%d', '%d', '%s', '%s', '%s' ] );
-
-        $report_id = (int) $wpdb->insert_id;
+        $report_id = DisputeRepository::createReport($reported_id, $reporter_id, $reason_key, $reason_detail);
         if ( ! $report_id ) {
             return $this->error('db_error', 'Failed to submit report.', 500);
         }
 
-        $this->emailReportedUser( $reported_user );
-        $this->emailAdminReport( $report_id, $reporter_id, $reported_user, $reason_key, $reason_detail );
+        // Emails queued async — never block the REST response with SMTP.
+        DisputeNotificationService::enqueueAsync('bcc_disputes_email_reported_user', [$reported_id]);
+        DisputeNotificationService::enqueueAsync('bcc_disputes_email_admin_report', [$report_id, $reporter_id, $reported_id, $reason_key, $reason_detail]);
 
         CoreLogger::audit('user_reported', ['reporter' => $reporter_id, 'reported' => $reported_id, 'reason' => $reason_key]);
 
         return rest_ensure_response([
             'message' => 'Your report has been submitted. Our team will review it shortly.',
         ]);
-    }
-
-    private function emailReportedUser( WP_User $reported_user ): void
-    {
-        $site_name = get_bloginfo('name');
-        $subject   = sprintf( '[%s] Your account has received a report', $site_name );
-        $body      = sprintf(
-            "Hello %s,\n\nWe wanted to let you know that a report has been submitted regarding your account on %s.\n\nOur moderation team will review the report and take appropriate action if necessary. No action is required from you at this time.\n\nIf you believe this report was made in error, you can contact us by replying to this email.\n\nThe %s Team",
-            $reported_user->display_name,
-            $site_name,
-            $site_name
-        );
-        wp_mail( $reported_user->user_email, $subject, $body );
-    }
-
-    private function emailAdminReport( int $report_id, int $reporter_id, WP_User $reported_user, string $reason_key, string $reason_detail ): void
-    {
-        $admin_email   = get_option('admin_email');
-        $site_name     = get_bloginfo('name');
-        $reporter      = get_userdata( $reporter_id );
-        $admin_url     = admin_url( 'admin.php?page=bcc-reports' );
-
-        $reason_labels = [
-            'spam'            => 'Spam or unsolicited content',
-            'harassment'      => 'Harassment or bullying',
-            'fraud'           => 'Fraudulent activity or scam',
-            'misinformation'  => 'False or misleading information',
-            'inappropriate'   => 'Inappropriate content',
-            'impersonation'   => 'Impersonating another person',
-            'other'           => 'Other',
-        ];
-
-        $subject = sprintf( '[%s Admin] User Report #%d — %s', $site_name, $report_id, $reason_labels[ $reason_key ] ?? $reason_key );
-        $body    = sprintf(
-            "A new user report has been submitted on %s.\n\n" .
-            "REPORT DETAILS\n" .
-            "--------------\n" .
-            "Report ID:       #%d\n" .
-            "Date/Time:       %s\n\n" .
-            "REPORTED USER\n" .
-            "-------------\n" .
-            "User ID:         %d\n" .
-            "Display Name:    %s\n" .
-            "Email:           %s\n" .
-            "Profile URL:     %s\n\n" .
-            "REPORTER\n" .
-            "--------\n" .
-            "User ID:         %d\n" .
-            "Display Name:    %s\n" .
-            "Email:           %s\n\n" .
-            "REASON\n" .
-            "------\n" .
-            "Category:        %s\n" .
-            "Details:         %s\n\n" .
-            "Review this report in the admin dashboard:\n%s\n",
-            $site_name,
-            $report_id,
-            current_time('mysql'),
-            $reported_user->ID,
-            $reported_user->display_name,
-            $reported_user->user_email,
-            get_author_posts_url( $reported_user->ID ),
-            $reporter_id,
-            $reporter ? $reporter->display_name : 'Unknown',
-            $reporter ? $reporter->user_email   : 'Unknown',
-            $reason_labels[ $reason_key ] ?? $reason_key,
-            $reason_detail ?: '(none provided)',
-            $admin_url
-        );
-
-        wp_mail( $admin_email, $subject, $body );
     }
 
     /**

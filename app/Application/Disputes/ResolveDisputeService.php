@@ -5,6 +5,7 @@ namespace BCC\Disputes\Application\Disputes;
 use BCC\Core\Contracts\DisputeAdjudicationInterface;
 use BCC\Core\ServiceLocator;
 use BCC\Disputes\Repositories\DisputeRepository;
+use BCC\Disputes\Services\DisputeNotificationService;
 use BCC\Disputes\Support\Logger;
 
 if (!defined('ABSPATH')) {
@@ -13,63 +14,63 @@ if (!defined('ABSPATH')) {
 
 final class ResolveDisputeService
 {
-    public function handle(ResolveDisputeCommand $command): void
+    public function handle(int $disputeId, int $voteId, int $pageId, int $voterId, int $reporterId, string $outcome): bool
     {
-        global $wpdb;
-
-        $disputeTable = DisputeRepository::disputes_table();
-
-        $wpdb->query('START TRANSACTION');
-
-        // Atomic status transition: WHERE status IN ('pending','reviewing')
+        // Atomic status transition via repository: WHERE status IN ('pending','reviewing')
         // prevents double-resolution under concurrent requests.
-        $result = $wpdb->query($wpdb->prepare(
-            "UPDATE {$disputeTable} SET status = %s, resolved_at = %s
-             WHERE id = %d AND status IN ('pending','reviewing')",
-            $command->outcome,
-            current_time('mysql'),
-            $command->disputeId
-        ));
+        // Transaction is left OPEN on success — we must commit or rollback.
+        $txn = DisputeRepository::beginResolveTransaction($disputeId, $outcome);
 
-        if ($result === false) {
-            $wpdb->query('ROLLBACK');
+        if ($txn['db_error']) {
             Logger::logFailure('resolve_rollback', [
-                'dispute_id' => $command->disputeId,
-                'outcome'    => $command->outcome,
+                'dispute_id' => $disputeId,
+                'outcome'    => $outcome,
                 'step'       => 'status_update',
-                'db_error'   => $wpdb->last_error,
+                'db_error'   => $txn['db_error'],
             ]);
-            return;
+            return false;
         }
 
-        if ($result === 0) {
+        if ($txn['race']) {
             // Already resolved by a concurrent request — safe to skip
-            $wpdb->query('ROLLBACK');
             Logger::logFailure('resolve_race_skipped', [
-                'dispute_id' => $command->disputeId,
-                'outcome'    => $command->outcome,
+                'dispute_id' => $disputeId,
+                'outcome'    => $outcome,
             ]);
-            return;
+            return false;
         }
 
         // ── Pre-commit gate: verify trust engine is available ────────────
         //
         // Check BEFORE committing the resolution. If the adjudicator is not
         // available, ROLLBACK so the dispute stays in its original state.
-        // This avoids the crash-between-commit-and-revert window.
-        $hasRealAdjudicator = class_exists('\\BCC\\Core\\ServiceLocator')
-            && ServiceLocator::hasRealService(DisputeAdjudicationInterface::class);
-
-        if (!$hasRealAdjudicator) {
-            $wpdb->query('ROLLBACK');
-            Logger::logFailure('trust_adjudication_service_unavailable', [
-                'dispute_id' => $command->disputeId,
-                'outcome'    => $command->outcome,
+        // Wrapped in try/catch to guarantee the open transaction is closed
+        // even if hasRealService() throws unexpectedly.
+        try {
+            $hasRealAdjudicator = ServiceLocator::hasRealService(DisputeAdjudicationInterface::class);
+        } catch (\Throwable $e) {
+            DisputeRepository::rollbackTransaction();
+            Logger::logFailure('trust_adjudication_check_failed', [
+                'dispute_id' => $disputeId,
+                'outcome'    => $outcome,
+                'error'      => $e->getMessage(),
             ]);
-            return;
+            return false;
         }
 
-        $wpdb->query('COMMIT');
+        if (!$hasRealAdjudicator) {
+            DisputeRepository::rollbackTransaction();
+            Logger::logFailure('trust_adjudication_service_unavailable', [
+                'dispute_id' => $disputeId,
+                'outcome'    => $outcome,
+            ]);
+            return false;
+        }
+
+        DisputeRepository::commitTransaction();
+
+        // Status changed — invalidate all caches tied to this dispute.
+        DisputeRepository::invalidateDispute($disputeId);
 
         // ── Post-commit: execute adjudication ────────────────────────────
         //
@@ -78,19 +79,19 @@ final class ResolveDisputeService
         $actorId     = get_current_user_id();
         $adjudicator = ServiceLocator::resolveDisputeAdjudication();
 
-        if ($command->outcome === 'accepted') {
+        if ($outcome === 'accepted') {
             $adjudicationSucceeded = $adjudicator->acceptVoteDispute(
-                $command->disputeId,
-                $command->voteId,
-                $command->pageId,
-                $command->voterId,
+                $disputeId,
+                $voteId,
+                $pageId,
+                $voterId,
                 $actorId
             );
         } else {
             $adjudicationSucceeded = $adjudicator->rejectVoteDispute(
-                $command->disputeId,
-                $command->voteId,
-                $command->pageId,
+                $disputeId,
+                $voteId,
+                $pageId,
                 $actorId
             );
         }
@@ -98,39 +99,34 @@ final class ResolveDisputeService
         if (!$adjudicationSucceeded) {
             // Adjudicator returned false — the vote/score operation failed.
             // Re-open the dispute so it can be retried.
-            $wpdb->update(
-                $disputeTable,
-                ['status' => 'reviewing', 'resolved_at' => null],
-                ['id' => $command->disputeId],
-                ['%s', '%s'],
-                ['%d']
-            );
+            DisputeRepository::reopenDispute($disputeId);
+
+            // Re-opened — invalidate caches again (status reverted to 'reviewing').
+            DisputeRepository::invalidateDispute($disputeId);
 
             Logger::logFailure('trust_adjudication_failed', [
-                'dispute_id' => $command->disputeId,
-                'vote_id'    => $command->voteId,
-                'outcome'    => $command->outcome,
+                'dispute_id' => $disputeId,
+                'vote_id'    => $voteId,
+                'outcome'    => $outcome,
                 'action'     => 'reopened_dispute',
             ]);
-            return;
+            return false;
         }
 
         // ── Adjudication succeeded — fire hooks and notify ───────────────
-        if ($command->outcome === 'accepted') {
-            do_action('bcc_dispute_accepted', $command->disputeId, $command->voteId, $command->pageId, $command->voterId);
+        if ($outcome === 'accepted') {
+            do_action('bcc_dispute_accepted', $disputeId, $voteId, $pageId, $voterId);
         } else {
-            do_action('bcc_dispute_rejected', $command->disputeId, $command->voteId, $command->pageId);
+            do_action('bcc_dispute_rejected', $disputeId, $voteId, $pageId);
+
+            // Reputation cost for filing a rejected dispute (-5 points).
+            // Makes dispute spam expensive — attackers can't brute-force
+            // downvote removal without paying a reputation price.
+            do_action('bcc.trust.dispute_rejected_penalty', $reporterId, $disputeId);
         }
 
-        $reporter = get_userdata($command->reporterId);
-        if ($reporter && $reporter->user_email) {
-            $subject = $command->outcome === 'accepted'
-                ? '[BCC] Your dispute was accepted — vote removed'
-                : '[BCC] Your dispute was reviewed — vote stands';
-            $body = $command->outcome === 'accepted'
-                ? 'Good news! The community panel reviewed your dispute and agreed the vote was invalid. It has been removed from your trust score.'
-                : 'The community panel reviewed your dispute and decided the vote was valid. The vote remains on your profile.';
-            wp_mail($reporter->user_email, $subject, $body);
-        }
+        DisputeNotificationService::enqueueAsync('bcc_disputes_email_reporter_result', [$reporterId, $outcome]);
+
+        return true;
     }
 }

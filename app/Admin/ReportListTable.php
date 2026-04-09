@@ -52,16 +52,8 @@ class ReportListTable extends WP_List_Table
         $current = isset($_GET['report_status']) ? sanitize_key($_GET['report_status']) : 'all';
         $base    = admin_url('admin.php?page=bcc-reports');
 
-        global $wpdb;
-        $reportTable = DisputeRepository::user_reports_table();
-
-        $counts = [];
-        $rows   = $wpdb->get_results("SELECT status, COUNT(*) as cnt FROM {$reportTable} GROUP BY status");
-        $total  = 0;
-        foreach ($rows as $r) {
-            $counts[$r->status] = (int) $r->cnt;
-            $total += (int) $r->cnt;
-        }
+        $counts = DisputeRepository::getReportStatusCounts();
+        $total  = array_sum($counts);
 
         $views = [];
         $views['all'] = sprintf(
@@ -88,18 +80,10 @@ class ReportListTable extends WP_List_Table
 
     public function prepare_items(): void
     {
-        global $wpdb;
-
-        $reportTable = DisputeRepository::user_reports_table();
-
         // Filters
-        $where  = '1=1';
-        $params = [];
-
         $status_filter = isset($_GET['report_status']) ? sanitize_key($_GET['report_status']) : '';
-        if ($status_filter && in_array($status_filter, ['open', 'reviewed', 'dismissed'], true)) {
-            $where   .= ' AND r.status = %s';
-            $params[] = $status_filter;
+        if (!in_array($status_filter, ['open', 'reviewed', 'dismissed'], true)) {
+            $status_filter = '';
         }
 
         // Sorting
@@ -110,10 +94,7 @@ class ReportListTable extends WP_List_Table
         $order = isset($_GET['order']) && strtoupper($_GET['order']) === 'ASC' ? 'ASC' : 'DESC';
 
         // Count
-        $count_sql = "SELECT COUNT(*) FROM {$reportTable} r WHERE {$where}";
-        $total     = $params
-            ? (int) $wpdb->get_var($wpdb->prepare($count_sql, ...$params))
-            : (int) $wpdb->get_var($count_sql);
+        $total = DisputeRepository::countReportsForAdminList($status_filter ?: null);
 
         // Pagination
         $per_page = 20;
@@ -126,21 +107,14 @@ class ReportListTable extends WP_List_Table
             'total_pages' => ceil($total / $per_page),
         ]);
 
-        // Query
-        $sql = "SELECT r.*,
-                       reported.display_name AS reported_name,
-                       reporter.display_name AS reporter_name
-                FROM {$reportTable} r
-                LEFT JOIN {$wpdb->users} reported ON r.reported_id = reported.ID
-                LEFT JOIN {$wpdb->users} reporter ON r.reporter_id = reporter.ID
-                WHERE {$where}
-                ORDER BY r.{$orderby} {$order}
-                LIMIT %d OFFSET %d";
-
-        $params[] = $per_page;
-        $params[] = $offset;
-
-        $this->items = $wpdb->get_results($wpdb->prepare($sql, ...$params));
+        // Query via repository — explicit columns, no SELECT *.
+        $this->items = DisputeRepository::getReportsForAdminList(
+            $status_filter ?: null,
+            $orderby,
+            $order,
+            $per_page,
+            $offset
+        );
 
         $this->_column_headers = [
             $this->get_columns(),

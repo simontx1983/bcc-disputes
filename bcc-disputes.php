@@ -62,11 +62,12 @@ register_deactivation_hook(__FILE__, function () {
 
 add_action('init', function () {
     \BCC\Disputes\Services\DisputeScheduler::boot();
+    \BCC\Disputes\Services\DisputeNotificationService::registerAsyncHandlers();
 });
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 add_action('rest_api_init', function () {
-    (new \BCC\Disputes\Controllers\DisputeController())->register_routes();
+    \BCC\Disputes\Plugin::instance()->controller()->register_routes();
 });
 
 add_action('wp_enqueue_scripts', function () {
@@ -164,13 +165,13 @@ add_shortcode('bcc_dispute_form', function ($atts) {
     }
 
     $atts = shortcode_atts(['page_id' => 0], $atts, 'bcc_dispute_form');
-    $page_id = (int) $atts['page_id'] ?: get_the_ID();
-    if (!$page_id) {
+    $attributes = ['pageId' => (int) $atts['page_id'] ?: get_the_ID()];
+    if (!$attributes['pageId']) {
         return '';
     }
 
     ob_start();
-    include BCC_DISPUTES_PATH . 'templates/dispute-form.php';
+    include BCC_DISPUTES_PATH . 'blocks/dispute-form/render.php';
     return ob_get_clean();
 });
 
@@ -184,7 +185,8 @@ add_shortcode('bcc_dispute_queue', function () {
         return '';
     }
 
+    $attributes = [];
     ob_start();
-    include BCC_DISPUTES_PATH . 'templates/dispute-queue.php';
+    include BCC_DISPUTES_PATH . 'blocks/dispute-queue/render.php';
     return ob_get_clean();
 });

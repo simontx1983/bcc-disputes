@@ -2,7 +2,7 @@
 
 namespace BCC\Disputes\Services;
 
-use BCC\Disputes\Controllers\DisputeController;
+use BCC\Disputes\Plugin;
 use BCC\Disputes\Repositories\DisputeRepository;
 
 if (!defined('ABSPATH')) {
@@ -28,6 +28,15 @@ class DisputeScheduler
     public static function boot(): void
     {
         add_action(self::EVENT_AUTO_RESOLVE, [__CLASS__, 'auto_resolve_expired']);
+        add_action('bcc_disputes_async_resolve', [__CLASS__, 'handleAsyncResolve'], 10, 6);
+    }
+
+    /**
+     * Async handler: resolve a single dispute outside the cron loop.
+     */
+    public static function handleAsyncResolve(int $dispute_id, int $vote_id, int $page_id, int $voter_id, int $reporter_id, string $outcome): void
+    {
+        Plugin::instance()->controller()->resolve($dispute_id, $vote_id, $page_id, $voter_id, $reporter_id, $outcome);
     }
 
     /**
@@ -37,30 +46,29 @@ class DisputeScheduler
      */
     public static function auto_resolve_expired(): void
     {
-        global $wpdb;
-
-        $disputeTable = DisputeRepository::disputes_table();
-        $cutoff       = date('Y-m-d H:i:s', current_time('timestamp') - (BCC_DISPUTES_TTL_DAYS * DAY_IN_SECONDS));
-
-        $expired = $wpdb->get_results($wpdb->prepare(
-            "SELECT id, panel_accepts, panel_rejects, vote_id, page_id, voter_id, reporter_id
-             FROM {$disputeTable}
-             WHERE status IN ('pending','reviewing')
-               AND created_at <= %s
-             ORDER BY created_at ASC
-             LIMIT 50",
-            $cutoff
-        ));
+        $cutoff  = gmdate('Y-m-d H:i:s', current_time('timestamp', true) - (BCC_DISPUTES_TTL_DAYS * DAY_IN_SECONDS));
+        $expired = DisputeRepository::getExpiredDisputes($cutoff, 50);
 
         if (empty($expired)) {
             return;
         }
 
-        $api = new DisputeController();
-
+        // Dispatch each resolution as an async action instead of resolving
+        // synchronously in a loop. Each resolve() triggers a DB transaction +
+        // trust-engine adjudication — blocking the cron with 50 sequential
+        // transactions causes timeouts at scale.
         foreach ($expired as $dispute) {
             $outcome = ((int) $dispute->panel_accepts > (int) $dispute->panel_rejects) ? 'accepted' : 'rejected';
-            $api->resolve((int) $dispute->id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $outcome);
+            $args = [
+                (int) $dispute->id,
+                (int) $dispute->vote_id,
+                (int) $dispute->page_id,
+                (int) $dispute->voter_id,
+                (int) $dispute->reporter_id,
+                $outcome,
+            ];
+
+            DisputeNotificationService::enqueueAsync('bcc_disputes_async_resolve', $args);
         }
     }
 

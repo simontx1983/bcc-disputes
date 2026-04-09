@@ -53,16 +53,8 @@ class DisputeListTable extends WP_List_Table
         $current = isset($_GET['dispute_status']) ? sanitize_key($_GET['dispute_status']) : 'all';
         $base    = admin_url('admin.php?page=bcc-disputes');
 
-        global $wpdb;
-        $disputeTable = DisputeRepository::disputes_table();
-
-        $counts = [];
-        $rows   = $wpdb->get_results("SELECT status, COUNT(*) as cnt FROM {$disputeTable} GROUP BY status");
-        $total  = 0;
-        foreach ($rows as $r) {
-            $counts[$r->status] = (int) $r->cnt;
-            $total += (int) $r->cnt;
-        }
+        $counts = DisputeRepository::getDisputeStatusCounts();
+        $total  = array_sum($counts);
 
         $views = [];
         $views['all'] = sprintf(
@@ -89,18 +81,10 @@ class DisputeListTable extends WP_List_Table
 
     public function prepare_items(): void
     {
-        global $wpdb;
-
-        $disputeTable = DisputeRepository::disputes_table();
-
         // Filters
-        $where  = '1=1';
-        $params = [];
-
         $status_filter = isset($_GET['dispute_status']) ? sanitize_key($_GET['dispute_status']) : '';
-        if ($status_filter && in_array($status_filter, ['pending', 'reviewing', 'accepted', 'rejected'], true)) {
-            $where   .= ' AND d.status = %s';
-            $params[] = $status_filter;
+        if (!in_array($status_filter, ['pending', 'reviewing', 'accepted', 'rejected'], true)) {
+            $status_filter = '';
         }
 
         // Sorting
@@ -111,10 +95,7 @@ class DisputeListTable extends WP_List_Table
         $order = isset($_GET['order']) && strtoupper($_GET['order']) === 'ASC' ? 'ASC' : 'DESC';
 
         // Count
-        $count_sql = "SELECT COUNT(*) FROM {$disputeTable} d WHERE {$where}";
-        $total     = $params
-            ? (int) $wpdb->get_var($wpdb->prepare($count_sql, ...$params))
-            : (int) $wpdb->get_var($count_sql);
+        $total = DisputeRepository::countDisputesForAdminList($status_filter ?: null);
 
         // Pagination
         $per_page = 20;
@@ -127,23 +108,14 @@ class DisputeListTable extends WP_List_Table
             'total_pages' => ceil($total / $per_page),
         ]);
 
-        // Query — own tables + WordPress core only.
-        $sql = "SELECT d.*,
-                       p.post_title   AS page_title,
-                       reporter.display_name AS reporter_name,
-                       voter.display_name    AS voter_name
-                FROM {$disputeTable} d
-                LEFT JOIN {$wpdb->posts} p         ON d.page_id     = p.ID
-                LEFT JOIN {$wpdb->users} reporter   ON d.reporter_id = reporter.ID
-                LEFT JOIN {$wpdb->users} voter      ON d.voter_id    = voter.ID
-                WHERE {$where}
-                ORDER BY d.{$orderby} {$order}
-                LIMIT %d OFFSET %d";
-
-        $params[] = $per_page;
-        $params[] = $offset;
-
-        $this->items = $wpdb->get_results($wpdb->prepare($sql, ...$params));
+        // Query via repository — explicit columns, no SELECT *.
+        $this->items = DisputeRepository::getDisputesForAdminList(
+            $status_filter ?: null,
+            $orderby,
+            $order,
+            $per_page,
+            $offset
+        );
 
         // Batch-enrich with vote data from trust-engine via interface.
         $vote_ids = array_filter(array_map(
@@ -153,7 +125,7 @@ class DisputeListTable extends WP_List_Table
 
         // NullTrustReadService::getVotesByIds() returns [] — admin sees empty vote_type column.
         $votes_by_id = [];
-        if (!empty($vote_ids) && class_exists('\\BCC\\Core\\ServiceLocator')) {
+        if (!empty($vote_ids)) {
             $votes_by_id = \BCC\Core\ServiceLocator::resolveTrustReadService()->getVotesByIds($vote_ids);
         }
 

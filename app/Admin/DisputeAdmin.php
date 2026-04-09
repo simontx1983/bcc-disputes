@@ -2,7 +2,7 @@
 
 namespace BCC\Disputes\Admin;
 
-use BCC\Disputes\Controllers\DisputeController;
+use BCC\Disputes\Plugin;
 use BCC\Disputes\Repositories\DisputeRepository;
 
 if (!defined('ABSPATH')) {
@@ -80,25 +80,7 @@ class DisputeAdmin
 
     private static function render_detail(int $dispute_id): void
     {
-        global $wpdb;
-
-        $disputeTable = DisputeRepository::disputes_table();
-        $panelTable   = DisputeRepository::panel_table();
-
-        // Fetch dispute — own tables + WordPress core only.
-        $dispute = $wpdb->get_row($wpdb->prepare(
-            "SELECT d.*,
-                    p.post_title   AS page_title,
-                    reporter.display_name AS reporter_name,
-                    voter.display_name    AS voter_name
-             FROM {$disputeTable} d
-             LEFT JOIN {$wpdb->posts} p         ON d.page_id     = p.ID
-             LEFT JOIN {$wpdb->users} reporter   ON d.reporter_id = reporter.ID
-             LEFT JOIN {$wpdb->users} voter      ON d.voter_id    = voter.ID
-             WHERE d.id = %d
-             LIMIT 1",
-            $dispute_id
-        ));
+        $dispute = DisputeRepository::getDisputeDetailForAdmin($dispute_id);
 
         if (!$dispute) {
             echo '<div class="wrap"><h1>' . esc_html__('Dispute Not Found', 'bcc-disputes') . '</h1></div>';
@@ -108,20 +90,13 @@ class DisputeAdmin
         // Enrich with vote data from trust-engine via interface.
         // NullTrustReadService::getVotesByIds() returns [] — admin sees "no vote data".
         $vote = null;
-        if (class_exists('\\BCC\\Core\\ServiceLocator') && $dispute->vote_id) {
+        if ($dispute->vote_id) {
             $votes = \BCC\Core\ServiceLocator::resolveTrustReadService()->getVotesByIds([(int) $dispute->vote_id]);
             $vote  = $votes[(int) $dispute->vote_id] ?? null;
         }
 
         // Panel votes.
-        $panelists = $wpdb->get_results($wpdb->prepare(
-            "SELECT pan.*, u.display_name
-             FROM {$panelTable} pan
-             LEFT JOIN {$wpdb->users} u ON pan.panelist_user_id = u.ID
-             WHERE pan.dispute_id = %d
-             ORDER BY pan.assigned_at ASC",
-            $dispute_id
-        ));
+        $panelists = DisputeRepository::getPanelistsForDispute($dispute_id);
 
         $back_url = admin_url('admin.php?page=bcc-disputes');
         $is_open  = in_array($dispute->status, ['pending', 'reviewing'], true);
@@ -144,6 +119,10 @@ class DisputeAdmin
                 '<div class="notice notice-success is-dismissible"><p>%s</p></div>',
                 esc_html(sprintf(__('Dispute resolved as %s.', 'bcc-disputes'), $outcome))
             );
+        } elseif (isset($_GET['resolve_failed'])) {
+            echo '<div class="notice notice-error is-dismissible"><p>'
+               . esc_html__('Resolution failed. The trust engine may be unavailable. The dispute remains open.', 'bcc-disputes')
+               . '</p></div>';
         }
 
         echo '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:16px;">';
@@ -305,9 +284,7 @@ class DisputeAdmin
             return;
         }
 
-        global $wpdb;
-        $disputeTable = DisputeRepository::disputes_table();
-        $dispute      = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$disputeTable} WHERE id = %d LIMIT 1", $dispute_id));
+        $dispute = DisputeRepository::getDisputeById($dispute_id);
 
         if (!$dispute) {
             return;
@@ -318,20 +295,25 @@ class DisputeAdmin
             return;
         }
 
-        $api = new DisputeController();
+        $api = Plugin::instance()->controller();
+        $success = false;
 
         if ($action === 'accepted' || $action === 'rejected') {
-            $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $action);
+            $success = $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $action);
         } elseif ($action === 'force_remove') {
             // Accept the dispute (removes vote + penalises voter)
-            $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, 'accepted');
+            $success = $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, 'accepted');
             $action = 'accepted';
         }
 
-        wp_safe_redirect(add_query_arg(
-            ['page' => 'bcc-disputes', 'dispute_id' => $dispute_id, 'resolved' => $action],
-            admin_url('admin.php')
-        ));
+        $query_args = ['page' => 'bcc-disputes', 'dispute_id' => $dispute_id];
+        if ($success) {
+            $query_args['resolved'] = $action;
+        } else {
+            $query_args['resolve_failed'] = 1;
+        }
+
+        wp_safe_redirect(add_query_arg($query_args, admin_url('admin.php')));
         exit;
     }
 
@@ -410,30 +392,20 @@ class DisputeAdmin
         check_admin_referer('bcc_report_action_' . $report_id);
 
         // Verify the report exists before updating
-        global $wpdb;
-        $reportTable = DisputeRepository::user_reports_table();
-        $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$reportTable} WHERE id = %d LIMIT 1", $report_id));
-        if (!$exists) {
+        if (!DisputeRepository::reportExists($report_id)) {
             return;
         }
 
-        $update_result = $wpdb->update(
-            $reportTable,
-            ['status' => $action, 'reviewed_at' => current_time('mysql')],
-            ['id' => $report_id],
-            ['%s', '%s'],
-            ['%d']
-        );
+        $update_ok = DisputeRepository::updateReportStatus($report_id, $action);
 
-        if ($update_result === false) {
+        if (!$update_ok) {
             if (class_exists('BCC\\Core\\Log\\Logger')) {
                 \BCC\Core\Log\Logger::error('[Disputes] report_action_failed', [
                     'report_id' => $report_id,
                     'action'    => $action,
-                    'db_error'  => $wpdb->last_error,
                 ]);
             } else {
-                error_log('[BCC Disputes] report_action_failed report_id=' . $report_id . ' error=' . $wpdb->last_error);
+                error_log('[BCC Disputes] report_action_failed report_id=' . $report_id);
             }
             wp_die(__('Failed to update report.', 'bcc-disputes'));
         }
