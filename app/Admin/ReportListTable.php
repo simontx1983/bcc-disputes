@@ -64,7 +64,7 @@ class ReportListTable extends WP_List_Table
             $total
         );
 
-        foreach (['open', 'reviewed', 'dismissed'] as $s) {
+        foreach (['open', 'reviewed', 'penalized', 'dismissed'] as $s) {
             $c = $counts[$s] ?? 0;
             $views[$s] = sprintf(
                 '<a href="%s" class="%s">%s <span class="count">(%d)</span></a>',
@@ -82,7 +82,7 @@ class ReportListTable extends WP_List_Table
     {
         // Filters
         $status_filter = isset($_GET['report_status']) ? sanitize_key($_GET['report_status']) : '';
-        if (!in_array($status_filter, ['open', 'reviewed', 'dismissed'], true)) {
+        if (!in_array($status_filter, ['open', 'reviewed', 'penalized', 'dismissed'], true)) {
             $status_filter = '';
         }
 
@@ -163,6 +163,7 @@ class ReportListTable extends WP_List_Table
                 $colors = [
                     'open'      => '#ed6c02',
                     'reviewed'  => '#2e7d32',
+                    'penalized' => '#d63638',
                     'dismissed' => '#666',
                 ];
                 $color = $colors[$item->status] ?? '#666';
@@ -178,7 +179,10 @@ class ReportListTable extends WP_List_Table
             case 'actions':
                 $is_open = $item->status === 'open';
                 if (!$is_open) {
-                    return '<em>' . esc_html(ucfirst($item->status)) . '</em>';
+                    $label = $item->status === 'penalized'
+                        ? sprintf(__('Penalized (-%s pts)', 'bcc-disputes'), esc_html($item->penalty_amount ?? '?'))
+                        : ucfirst($item->status);
+                    return '<em>' . esc_html($label) . '</em>';
                 }
 
                 $reviewed_url = wp_nonce_url(
@@ -190,6 +194,8 @@ class ReportListTable extends WP_List_Table
                     'bcc_report_action_' . (int) $item->id
                 );
 
+                $penalize_nonce = wp_create_nonce('bcc_report_penalize_' . (int) $item->id);
+
                 return sprintf(
                     '<a href="%s" class="button button-small" onclick="return confirm(\'%s\');">%s</a> ',
                     esc_url($reviewed_url),
@@ -200,6 +206,21 @@ class ReportListTable extends WP_List_Table
                     esc_url($dismissed_url),
                     esc_js(__('Dismiss this report?', 'bcc-disputes')),
                     esc_html__('Dismiss', 'bcc-disputes')
+                ) . sprintf(
+                    '<form method="post" action="%s" style="display:inline-flex;align-items:center;gap:4px;margin-top:6px;" '
+                    . 'onsubmit="return confirm(\'Reduce this user\\\'s reputation score?\');">'
+                    . '<input type="hidden" name="page" value="bcc-reports" />'
+                    . '<input type="hidden" name="report_action" value="penalize" />'
+                    . '<input type="hidden" name="report_id" value="%d" />'
+                    . '<input type="hidden" name="_wpnonce" value="%s" />'
+                    . '<label style="font-size:12px;white-space:nowrap;">Penalize:</label>'
+                    . '<input type="number" name="penalty_points" min="1" max="50" value="5" '
+                    .   'style="width:55px;height:28px;padding:2px 4px;" title="Points to deduct (1-50)" />'
+                    . '<button type="submit" class="button button-small" style="color:#d63638;">Apply</button>'
+                    . '</form>',
+                    esc_url(admin_url('admin-post.php')),
+                    (int) $item->id,
+                    esc_attr($penalize_nonce)
                 );
 
             default:

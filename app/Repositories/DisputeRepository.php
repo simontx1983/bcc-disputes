@@ -846,6 +846,17 @@ class DisputeRepository
         ));
     }
 
+    public static function getReportById(int $reportId): ?object
+    {
+        global $wpdb;
+        $table = self::user_reports_table();
+
+        return $wpdb->get_row($wpdb->prepare(
+            "SELECT " . self::REPORT_COLUMNS . " FROM {$table} WHERE id = %d LIMIT 1",
+            $reportId
+        ));
+    }
+
     /**
      * Update a report's status and reviewed_at timestamp.
      *
