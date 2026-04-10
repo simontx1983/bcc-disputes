@@ -173,12 +173,15 @@ class DisputeRepository
         }
 
         // Atomic duplicate check: verify no active dispute exists for this
-        // vote_id while holding the FOR UPDATE lock. Prevents race where two
-        // concurrent submissions both pass the controller-level check.
+        // vote_id while holding a row-level lock. FOR UPDATE ensures that a
+        // concurrent transaction inserting for the same vote_id will block
+        // until this transaction commits or rolls back, preventing duplicate
+        // disputes from being created via race condition.
         $voteId = (int) $disputeData['vote_id'];
         $existingForVote = $wpdb->get_var($wpdb->prepare(
             "SELECT id FROM {$disputeTable}
              WHERE vote_id = %d AND status = 'reviewing'
+             FOR UPDATE
              LIMIT 1",
             $voteId
         ));
@@ -654,6 +657,9 @@ class DisputeRepository
         }
 
         $wpdb->query('COMMIT');
+
+        wp_cache_delete('report_status_counts', self::CACHE_GROUP);
+
         return $id;
     }
 
@@ -1203,6 +1209,24 @@ class DisputeRepository
         }
     }
 
+    // ── Reconciliation helpers ──────────────────────────────────────────────
+
+    /**
+     * Atomically increment the reopen_count circuit breaker for a dispute.
+     */
+    public static function incrementReopenCount(int $disputeId): void
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$table} SET reopen_count = reopen_count + 1 WHERE id = %d",
+            $disputeId
+        ));
+
+        self::invalidateDispute($disputeId);
+    }
+
     // ── Notification idempotency ───────────────────────────────────────────
 
     /**
@@ -1260,7 +1284,8 @@ class DisputeRepository
             INDEX idx_status (status),
             INDEX idx_reporter (reporter_id),
             INDEX idx_status_created (status, created_at),
-            INDEX idx_adjudication (adjudication_status)
+            INDEX idx_adjudication (adjudication_status),
+            INDEX idx_reconcile (status, adjudication_status, resolved_at)
         ) {$charset};
 
         CREATE TABLE {$panel} (
@@ -1302,6 +1327,14 @@ class DisputeRepository
         ";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-        dbDelta($sql);
+
+        // dbDelta() is most reliable with one CREATE TABLE per call.
+        $statements = preg_split('/(?=CREATE TABLE)/i', $sql, -1, PREG_SPLIT_NO_EMPTY);
+        foreach ($statements as $statement) {
+            $statement = trim($statement);
+            if ($statement !== '') {
+                dbDelta($statement);
+            }
+        }
     }
 }

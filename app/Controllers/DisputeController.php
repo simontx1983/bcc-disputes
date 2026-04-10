@@ -333,7 +333,11 @@ class DisputeController
         $total_voted = $accepts + $rejects;
         $panel_size  = (int) $dispute->panel_size;
         $majority    = (int) floor($panel_size / 2) + 1;
-        $should_resolve = ($accepts >= $majority || $rejects >= $majority || $total_voted >= $panel_size);
+        // Quorum: at least 3 votes required (or panel_size if smaller).
+        $quorum      = min(3, $panel_size);
+        // Resolution requires both a clear majority of the FULL panel size
+        // AND quorum participation. This prevents 2-0 outcomes with 3 abstentions.
+        $should_resolve = $total_voted >= $quorum && ($accepts >= $majority || $rejects >= $majority);
 
         CoreLogger::audit('dispute_vote_cast', ['dispute_id' => $dispute_id, 'user_id' => $userId, 'decision' => $decision]);
 
@@ -345,10 +349,12 @@ class DisputeController
             $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $final);
         }
 
+        // Tally intentionally omitted from response to preserve
+        // independent deliberation — panelists must not see running
+        // totals before all votes are in.
         return rest_ensure_response([
             'message'  => 'Vote recorded.',
             'decision' => $decision,
-            'tally'    => ['accept' => $accepts, 'reject' => $rejects],
         ]);
     }
 
@@ -373,11 +379,19 @@ class DisputeController
             return $this->error('already_resolved', 'This dispute has already been resolved.', 409);
         }
 
+        $adminId = get_current_user_id();
+
         $success = $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $decision);
 
         if (!$success) {
             return $this->error('resolution_failed', 'Dispute could not be resolved. Trust engine may be unavailable.', 503);
         }
+
+        CoreLogger::audit('dispute_force_resolved', [
+            'dispute_id' => $dispute_id,
+            'admin_id'   => $adminId,
+            'decision'   => $decision,
+        ]);
 
         return rest_ensure_response(['message' => 'Dispute resolved as ' . $decision . '.']);
     }
@@ -448,14 +462,19 @@ class DisputeController
             'resolved_at'   => $d->resolved_at ?? null,
         ];
 
-        // Hide reporter identity and vote tallies from panelists who
-        // have not yet cast their vote to enforce independent deliberation.
-        $userId = get_current_user_id();
+        // Hide reporter identity and vote tallies from panelists until
+        // ALL panel votes are in. This enforces independent deliberation —
+        // even panelists who have already voted must not see running totals
+        // to prevent them from sharing tally information with allies.
+        $userId     = get_current_user_id();
         $isPanelist = property_exists($d, 'my_decision');
         $isReporter = (int) $d->reporter_id === $userId;
         $isAdmin    = current_user_can('manage_options');
+        $totalVoted = (int) $d->panel_accepts + (int) $d->panel_rejects;
+        $panelSize  = (int) $d->panel_size;
+        $votingComplete = ($totalVoted >= $panelSize) || in_array($d->status, ['accepted', 'rejected'], true);
 
-        if ($isPanelist && !$isReporter && !$isAdmin && $data['my_decision'] === null) {
+        if ($isPanelist && !$isReporter && !$isAdmin && !$votingComplete) {
             $data['reporter_name'] = null;
             $data['accepts']       = null;
             $data['rejects']       = null;

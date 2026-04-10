@@ -92,7 +92,23 @@ class DisputeScheduler
         // trust-engine adjudication — blocking the cron with 50 sequential
         // transactions causes timeouts at scale.
         foreach ($expired as $dispute) {
-            $outcome = ((int) $dispute->panel_accepts > (int) $dispute->panel_rejects) ? 'accepted' : 'rejected';
+            $accepts    = (int) $dispute->panel_accepts;
+            $rejects    = (int) $dispute->panel_rejects;
+            $panelSize  = (int) $dispute->panel_size;
+            $majority   = (int) floor($panelSize / 2) + 1;
+            $quorum     = min(3, $panelSize);
+            $totalVoted = $accepts + $rejects;
+
+            // Auto-resolve requires quorum (3+ votes) AND a majority of
+            // the full panel size — not just majority of votes cast.
+            // If quorum is not met or no majority of panel, reject by
+            // default (protects the original voter's decision).
+            if ($totalVoted >= $quorum && $accepts >= $majority) {
+                $outcome = 'accepted';
+            } else {
+                $outcome = 'rejected';
+            }
+
             $args = [
                 (int) $dispute->id,
                 (int) $dispute->vote_id,
@@ -122,6 +138,26 @@ class DisputeScheduler
      */
     public static function reconcileOrphanedDisputes(): void
     {
+        if (!DisputeRepository::acquireAutoResolveLock()) {
+            return; // Another process is running — skip this tick.
+        }
+
+        try {
+            self::doReconcile();
+        } finally {
+            DisputeRepository::releaseAutoResolveLock();
+        }
+    }
+
+    private static function doReconcile(): void
+    {
+        // PHASE A: Retry stuck "reviewing" disputes where all votes are in
+        // but resolution failed (trust engine was unavailable at resolution time).
+        // These are invisible to the orphan query (which only looks for
+        // accepted/rejected status), so they'd wait 7 days for auto-resolve.
+        self::retryStuckReviewingDisputes();
+
+        // PHASE B: Retry orphaned adjudications (committed but never completed).
         $orphans = DisputeRepository::getOrphanedDisputes(10);
 
         if (empty($orphans)) {
@@ -167,20 +203,74 @@ class DisputeScheduler
             } else {
                 // Increment reopen_count as circuit breaker.
                 DisputeRepository::setAdjudicationStatus($disputeId, 'failed');
-                // The reopen_count increment happens via the existing reopenDispute
-                // mechanism or directly here for the reconciliation path.
-                global $wpdb;
-                $table = DisputeRepository::disputes_table();
-                $wpdb->query($wpdb->prepare(
-                    "UPDATE {$table} SET reopen_count = reopen_count + 1 WHERE id = %d",
-                    $disputeId
-                ));
+                DisputeRepository::incrementReopenCount($disputeId);
 
                 CoreLogger::error('[bcc-disputes] reconcile_failed', [
                     'dispute_id'   => $disputeId,
                     'reopen_count' => (int) $dispute->reopen_count + 1,
                 ]);
             }
+        }
+    }
+
+    /**
+     * Find disputes stuck in "reviewing" where total votes >= panel_size
+     * (all votes are in but resolution was never executed — typically
+     * because the trust engine was unavailable at the moment of the
+     * deciding vote). Re-trigger resolution for these disputes.
+     */
+    private static function retryStuckReviewingDisputes(): void
+    {
+        global $wpdb;
+        $table = DisputeRepository::disputes_table();
+
+        // Grace period: only retry disputes where the last vote was > 2 minutes ago.
+        $cutoff = gmdate('Y-m-d H:i:s', time() - 120);
+
+        $stuck = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, vote_id, page_id, voter_id, reporter_id,
+                    panel_accepts, panel_rejects, panel_size
+             FROM {$table}
+             WHERE status = 'reviewing'
+               AND (panel_accepts + panel_rejects) >= panel_size
+               AND created_at < %s
+             LIMIT 10",
+            $cutoff
+        ));
+
+        if (empty($stuck)) {
+            return;
+        }
+
+        foreach ($stuck as $dispute) {
+            $accepts   = (int) $dispute->panel_accepts;
+            $rejects   = (int) $dispute->panel_rejects;
+            $panelSize = (int) $dispute->panel_size;
+            $majority  = (int) floor($panelSize / 2) + 1;
+            $quorum    = min(3, $panelSize);
+            $totalVoted = $accepts + $rejects;
+
+            if ($totalVoted >= $quorum && $accepts >= $majority) {
+                $outcome = 'accepted';
+            } else {
+                $outcome = 'rejected';
+            }
+
+            CoreLogger::info('[bcc-disputes] retry_stuck_reviewing', [
+                'dispute_id' => (int) $dispute->id,
+                'accepts'    => $accepts,
+                'rejects'    => $rejects,
+                'outcome'    => $outcome,
+            ]);
+
+            DisputeNotificationService::enqueueAsync('bcc_disputes_async_resolve', [
+                (int) $dispute->id,
+                (int) $dispute->vote_id,
+                (int) $dispute->page_id,
+                (int) $dispute->voter_id,
+                (int) $dispute->reporter_id,
+                $outcome,
+            ]);
         }
     }
 
