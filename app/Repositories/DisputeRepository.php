@@ -158,6 +158,20 @@ class DisputeRepository
             return ['id' => null, 'failed_panelist' => null, 'db_error' => 'dispute_limit_reached'];
         }
 
+        // Per-reporter global limit: max 5 active disputes at any time.
+        // Prevents panelist pool exhaustion by users with many pages.
+        $reporterId = (int) $disputeData['reporter_id'];
+        $activeReporterCount = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$disputeTable}
+             WHERE reporter_id = %d AND status = 'reviewing'
+             FOR UPDATE",
+            $reporterId
+        ));
+        if ($activeReporterCount >= 5) {
+            $wpdb->query('ROLLBACK');
+            return ['id' => null, 'failed_panelist' => null, 'db_error' => 'reporter_limit_reached'];
+        }
+
         // Atomic duplicate check: verify no active dispute exists for this
         // vote_id while holding the FOR UPDATE lock. Prevents race where two
         // concurrent submissions both pass the controller-level check.
@@ -171,6 +185,20 @@ class DisputeRepository
         if ($existingForVote) {
             $wpdb->query('ROLLBACK');
             return ['id' => null, 'failed_panelist' => null, 'db_error' => 'already_disputed'];
+        }
+
+        // Verify the vote is still active (status=1). Prevents creating a
+        // dispute for a vote removed between the controller check and now.
+        if (class_exists('\\BCC\\Trust\\Database\\TableRegistry')) {
+            $votesTable = \BCC\Trust\Database\TableRegistry::votes();
+            $voteStillActive = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM {$votesTable} WHERE id = %d AND status = 1 LIMIT 1",
+                $voteId
+            ));
+            if (!$voteStillActive) {
+                $wpdb->query('ROLLBACK');
+                return ['id' => null, 'failed_panelist' => null, 'db_error' => 'vote_no_longer_active'];
+            }
         }
 
         $wpdb->insert($disputeTable, [
@@ -585,6 +613,32 @@ class DisputeRepository
         global $wpdb;
         $table = self::user_reports_table();
 
+        $wpdb->query('START TRANSACTION');
+
+        // Atomic daily limit + duplicate check under FOR UPDATE lock.
+        $recentCount = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE reporter_id = %d
+               AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 24 HOUR)
+             FOR UPDATE",
+            $reporterId
+        ));
+        if ($recentCount >= 5) {
+            $wpdb->query('ROLLBACK');
+            return null;
+        }
+
+        $hasDupe = (bool) $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$table}
+             WHERE reporter_id = %d AND reported_id = %d AND status = 'open'
+             LIMIT 1",
+            $reporterId, $reportedId
+        ));
+        if ($hasDupe) {
+            $wpdb->query('ROLLBACK');
+            return null;
+        }
+
         $wpdb->insert($table, [
             'reported_id'   => $reportedId,
             'reporter_id'   => $reporterId,
@@ -594,7 +648,13 @@ class DisputeRepository
         ], ['%d', '%d', '%s', '%s', '%s']);
 
         $id = (int) $wpdb->insert_id;
-        return $id ?: null;
+        if (!$id) {
+            $wpdb->query('ROLLBACK');
+            return null;
+        }
+
+        $wpdb->query('COMMIT');
+        return $id;
     }
 
     // ── Admin query methods ──────────────────────────────────────────────────
@@ -833,6 +893,20 @@ class DisputeRepository
     }
 
     /**
+     * Count open reports against a single target user.
+     * Used to cap coordinated report campaigns.
+     */
+    public static function countActiveReportsAgainst(int $reportedId): int
+    {
+        global $wpdb;
+        $table = self::user_reports_table();
+        return (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table} WHERE reported_id = %d AND status = 'open'",
+            $reportedId
+        ));
+    }
+
+    /**
      * Check whether a report exists.
      */
     public static function reportExists(int $reportId): bool
@@ -1020,13 +1094,71 @@ class DisputeRepository
         global $wpdb;
         $table = self::disputes_table();
 
+        // Circuit breaker: max 2 reopens. After that, leave it resolved
+        // and log for manual admin review rather than looping forever.
+        $reopenCount = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT reopen_count FROM {$table} WHERE id = %d",
+            $disputeId
+        ));
+        if ($reopenCount >= 2) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] reopen_circuit_breaker', [
+                'dispute_id'   => $disputeId,
+                'reopen_count' => $reopenCount,
+            ]);
+            return false;
+        }
+
         $result = $wpdb->query($wpdb->prepare(
-            "UPDATE {$table} SET status = 'reviewing', resolved_at = NULL
+            "UPDATE {$table} SET status = 'reviewing', resolved_at = NULL, reopen_count = reopen_count + 1
              WHERE id = %d AND status IN ('accepted','rejected')",
             $disputeId
         ));
 
         return $result !== false && $result > 0;
+    }
+
+    // ── Adjudication status tracking ──────────────────────────────────────
+
+    /**
+     * Mark the adjudication status for a dispute.
+     * Values: 'pending' (committed, awaiting adjudication),
+     *         'completed' (adjudication succeeded),
+     *         'failed' (adjudication failed, requires reconciliation).
+     */
+    public static function setAdjudicationStatus(int $disputeId, string $status): void
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$table} SET adjudication_status = %s WHERE id = %d",
+            $status,
+            $disputeId
+        ));
+    }
+
+    /**
+     * Find disputes that are resolved but adjudication never completed.
+     * These are split-brain orphans that need reconciliation.
+     *
+     * @param int $limit Max disputes to return per batch.
+     * @return array
+     */
+    public static function getOrphanedDisputes(int $limit = 10): array
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT id, vote_id, page_id, reporter_id, voter_id, status, reopen_count
+             FROM {$table}
+             WHERE status IN ('accepted', 'rejected')
+               AND adjudication_status IN ('pending', 'failed')
+               AND reopen_count < 3
+               AND resolved_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 MINUTE)
+             ORDER BY resolved_at ASC
+             LIMIT %d",
+            $limit
+        ));
     }
 
     // ── Cache invalidation ─────────────────────────────────────────────────
@@ -1114,10 +1246,12 @@ class DisputeRepository
             reason          VARCHAR(1000)   NOT NULL DEFAULT '',
             evidence_url    VARCHAR(2083)            DEFAULT NULL,
             status          VARCHAR(20)     NOT NULL DEFAULT 'reviewing',
+            adjudication_status VARCHAR(20) NOT NULL DEFAULT 'none',
             panel_accepts   TINYINT UNSIGNED NOT NULL DEFAULT 0,
             panel_rejects   TINYINT UNSIGNED NOT NULL DEFAULT 0,
             panel_size      TINYINT UNSIGNED NOT NULL DEFAULT 5,
             created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reopen_count    TINYINT UNSIGNED NOT NULL DEFAULT 0,
             resolved_at              DATETIME DEFAULT NULL,
             resolved_notified_at     DATETIME DEFAULT NULL,
             PRIMARY KEY (id),
@@ -1125,7 +1259,8 @@ class DisputeRepository
             INDEX idx_vote   (vote_id),
             INDEX idx_status (status),
             INDEX idx_reporter (reporter_id),
-            INDEX idx_status_created (status, created_at)
+            INDEX idx_status_created (status, created_at),
+            INDEX idx_adjudication (adjudication_status)
         ) {$charset};
 
         CREATE TABLE {$panel} (

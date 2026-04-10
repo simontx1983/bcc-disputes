@@ -125,6 +125,13 @@ class DisputeController
             return $this->error('cannot_self_dispute', 'You cannot dispute your own vote.', 400);
         }
 
+        // Only downvotes can be disputed — upvotes benefit the page owner,
+        // so disputing one is either an error or an attempt to weaponize
+        // the fraud penalty against the voter.
+        if ((int) $vote->vote_type > 0) {
+            return $this->error('upvote_not_disputable', 'Only downvotes can be disputed.', 400);
+        }
+
         // One active dispute per vote
         if (DisputeRepository::hasActiveDisputeForVote($vote_id)) {
             return $this->error('already_disputed', 'This vote already has an active dispute.', 409);
@@ -156,6 +163,12 @@ class DisputeController
             // Atomic limit check inside transaction returned this error
             if ($result['db_error'] === 'dispute_limit_reached') {
                 return $this->error('dispute_limit_reached', 'This page has reached its dispute limit. Please try again later.', 429);
+            }
+            if ($result['db_error'] === 'reporter_limit_reached') {
+                return $this->error('reporter_limit_reached', 'You have too many active disputes. Please wait for existing disputes to resolve.', 429);
+            }
+            if ($result['db_error'] === 'vote_no_longer_active') {
+                return $this->error('vote_no_longer_active', 'This vote is no longer active and cannot be disputed.', 410);
             }
             if ($result['db_error'] === 'already_disputed') {
                 return $this->error('already_disputed', 'This vote already has an active dispute.', 409);
@@ -446,6 +459,10 @@ class DisputeController
             $data['reporter_name'] = null;
             $data['accepts']       = null;
             $data['rejects']       = null;
+            // Mask final outcome to prevent tally inference from status changes.
+            if (in_array($data['status'], ['accepted', 'rejected'], true)) {
+                $data['status'] = 'closed';
+            }
         }
 
         return $data;
@@ -483,6 +500,11 @@ class DisputeController
 
         if ( DisputeRepository::hasActiveReport($reporter_id, $reported_id) ) {
             return $this->error('already_reported', 'You have already submitted an active report against this user.', 409);
+        }
+
+        // Protect targets from coordinated report campaigns.
+        if ( DisputeRepository::countActiveReportsAgainst($reported_id) >= 10 ) {
+            return $this->error('target_report_limit', 'This user already has reports pending review.', 429);
         }
 
         $report_id = DisputeRepository::createReport($reported_id, $reporter_id, $reason_key, $reason_detail);

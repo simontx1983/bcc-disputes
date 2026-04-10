@@ -214,8 +214,10 @@ class ReportListTable extends WP_List_Table
                     . '<input type="hidden" name="report_id" value="%d" />'
                     . '<input type="hidden" name="_wpnonce" value="%s" />'
                     . '<label style="font-size:12px;white-space:nowrap;">Penalize:</label>'
-                    . '<input type="number" name="penalty_points" min="1" max="50" value="5" '
-                    .   'style="width:55px;height:28px;padding:2px 4px;" title="Points to deduct (1-50)" />'
+                    . '<input type="number" name="penalty_points" min="1" max="20" value="5" '
+                    .   'style="width:55px;height:28px;padding:2px 4px;" title="Points to deduct (1-20)" />'
+                    . '<input type="text" name="penalty_reason" placeholder="Reason..." '
+                    .   'style="width:120px;height:28px;padding:2px 4px;font-size:12px;" />'
                     . '<button type="submit" class="button button-small" style="color:#d63638;">Apply</button>'
                     . '</form>',
                     esc_url(admin_url('admin-post.php')),

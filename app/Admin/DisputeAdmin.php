@@ -419,45 +419,38 @@ class DisputeAdmin
             wp_die(__('Unauthorized.', 'bcc-disputes'));
         }
 
-        $report_id     = absint($_POST['report_id'] ?? 0);
+        $report_id      = absint($_POST['report_id'] ?? 0);
         $penalty_points = absint($_POST['penalty_points'] ?? 0);
+        $penalty_reason = sanitize_textarea_field($_POST['penalty_reason'] ?? '');
 
-        if (!$report_id || $penalty_points < 1 || $penalty_points > 50) {
-            wp_die(__('Invalid penalty amount. Must be between 1 and 50.', 'bcc-disputes'));
+        if (!$report_id || $penalty_points < 1 || $penalty_points > 20) {
+            wp_die(__('Invalid penalty amount. Must be between 1 and 20.', 'bcc-disputes'));
         }
 
         check_admin_referer('bcc_report_penalize_' . $report_id);
 
-        // Get the report to find the reported user
-        $report = DisputeRepository::getReportById($report_id);
-        if (!$report || $report->status !== 'open') {
-            wp_die(__('Report not found or already resolved.', 'bcc-disputes'));
-        }
-
-        $reported_user_id = (int) $report->reported_id;
-
-        // Apply reputation penalty via trust-engine
-        if (\BCC\Core\ServiceLocator::hasRealService(\BCC\Core\Contracts\TrustReadServiceInterface::class)) {
-            $reputationRepo = \BCC\Trust\Plugin::instance()->reputationRepository();
-            $reputationRepo->adjustScore($reported_user_id, -1 * abs($penalty_points), 'admin_report_penalty');
-        }
-
-        // Update report status to 'penalized'
+        // Claim the report atomically FIRST — prevents double-penalize race.
+        // updateReportStatus uses WHERE status = 'open', so only one request wins.
         $update_ok = DisputeRepository::updateReportStatus($report_id, 'penalized');
 
         if (!$update_ok) {
-            \BCC\Core\Log\Logger::error('[Disputes] report_penalize_failed', [
-                'report_id' => $report_id,
-                'user_id'   => $reported_user_id,
-                'penalty'   => $penalty_points,
-            ]);
-            wp_die(__('Failed to update report.', 'bcc-disputes'));
+            wp_die(__('Report not found or already resolved.', 'bcc-disputes'));
+        }
+
+        // Status claimed — now safe to apply penalty (only runs once).
+        $report = DisputeRepository::getReportById($report_id);
+        $reported_user_id = (int) $report->reported_id;
+
+        if (\BCC\Core\ServiceLocator::hasRealService(\BCC\Core\Contracts\TrustReadServiceInterface::class)) {
+            $reputationRepo = \BCC\Trust\Plugin::instance()->reputationRepository();
+            $reputationRepo->adjustScore($reported_user_id, -1 * abs($penalty_points), 'admin_report_penalty');
         }
 
         \BCC\Core\Log\Logger::audit('[Disputes] admin_report_penalty', [
             'report_id'  => $report_id,
             'user_id'    => $reported_user_id,
             'penalty'    => $penalty_points,
+            'reason'     => $penalty_reason,
             'admin_id'   => get_current_user_id(),
         ]);
 
