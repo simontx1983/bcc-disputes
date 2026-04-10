@@ -1,12 +1,12 @@
 <?php
 
-namespace BCC\Disputes\Application\Disputes;
+namespace BCC\Disputes\Services;
 
 use BCC\Core\Contracts\DisputeAdjudicationInterface;
 use BCC\Core\ServiceLocator;
 use BCC\Disputes\Repositories\DisputeRepository;
 use BCC\Disputes\Services\DisputeNotificationService;
-use BCC\Disputes\Support\Logger;
+use BCC\Core\Log\Logger as CoreLogger;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -14,15 +14,15 @@ if (!defined('ABSPATH')) {
 
 final class ResolveDisputeService
 {
-    public function handle(int $disputeId, int $voteId, int $pageId, int $voterId, int $reporterId, string $outcome): bool
+    public function handle(int $disputeId, int $voteId, int $pageId, int $voterId, int $reporterId, string $outcome, ?int $actorId = null): bool
     {
-        // Atomic status transition via repository: WHERE status IN ('pending','reviewing')
+        // Atomic status transition via repository: WHERE status = 'reviewing'
         // prevents double-resolution under concurrent requests.
         // Transaction is left OPEN on success — we must commit or rollback.
         $txn = DisputeRepository::beginResolveTransaction($disputeId, $outcome);
 
         if ($txn['db_error']) {
-            Logger::logFailure('resolve_rollback', [
+            CoreLogger::error('[bcc-disputes] ' .'resolve_rollback', [
                 'dispute_id' => $disputeId,
                 'outcome'    => $outcome,
                 'step'       => 'status_update',
@@ -33,7 +33,7 @@ final class ResolveDisputeService
 
         if ($txn['race']) {
             // Already resolved by a concurrent request — safe to skip
-            Logger::logFailure('resolve_race_skipped', [
+            CoreLogger::error('[bcc-disputes] ' .'resolve_race_skipped', [
                 'dispute_id' => $disputeId,
                 'outcome'    => $outcome,
             ]);
@@ -50,7 +50,7 @@ final class ResolveDisputeService
             $hasRealAdjudicator = ServiceLocator::hasRealService(DisputeAdjudicationInterface::class);
         } catch (\Throwable $e) {
             DisputeRepository::rollbackTransaction();
-            Logger::logFailure('trust_adjudication_check_failed', [
+            CoreLogger::error('[bcc-disputes] ' .'trust_adjudication_check_failed', [
                 'dispute_id' => $disputeId,
                 'outcome'    => $outcome,
                 'error'      => $e->getMessage(),
@@ -60,7 +60,7 @@ final class ResolveDisputeService
 
         if (!$hasRealAdjudicator) {
             DisputeRepository::rollbackTransaction();
-            Logger::logFailure('trust_adjudication_service_unavailable', [
+            CoreLogger::error('[bcc-disputes] ' .'trust_adjudication_service_unavailable', [
                 'dispute_id' => $disputeId,
                 'outcome'    => $outcome,
             ]);
@@ -76,7 +76,7 @@ final class ResolveDisputeService
         //
         // The dispute is now marked resolved in the DB. We must attempt the
         // trust-engine operation. If it fails, re-open the dispute.
-        $actorId     = get_current_user_id();
+        $actorId     = $actorId ?? get_current_user_id();
         $adjudicator = ServiceLocator::resolveDisputeAdjudication();
 
         if ($outcome === 'accepted') {
@@ -104,7 +104,7 @@ final class ResolveDisputeService
             // Re-opened — invalidate caches again (status reverted to 'reviewing').
             DisputeRepository::invalidateDispute($disputeId);
 
-            Logger::logFailure('trust_adjudication_failed', [
+            CoreLogger::error('[bcc-disputes] ' .'trust_adjudication_failed', [
                 'dispute_id' => $disputeId,
                 'vote_id'    => $voteId,
                 'outcome'    => $outcome,
@@ -114,18 +114,14 @@ final class ResolveDisputeService
         }
 
         // ── Adjudication succeeded — fire hooks and notify ───────────────
-        if ($outcome === 'accepted') {
-            do_action('bcc_dispute_accepted', $disputeId, $voteId, $pageId, $voterId);
-        } else {
-            do_action('bcc_dispute_rejected', $disputeId, $voteId, $pageId);
-
+        if ($outcome === 'rejected') {
             // Reputation cost for filing a rejected dispute (-5 points).
             // Makes dispute spam expensive — attackers can't brute-force
             // downvote removal without paying a reputation price.
             do_action('bcc.trust.dispute_rejected_penalty', $reporterId, $disputeId);
         }
 
-        DisputeNotificationService::enqueueAsync('bcc_disputes_email_reporter_result', [$reporterId, $outcome]);
+        DisputeNotificationService::enqueueAsync('bcc_disputes_email_reporter_result', [$disputeId, $reporterId, $outcome]);
 
         return true;
     }

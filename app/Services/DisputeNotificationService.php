@@ -2,6 +2,7 @@
 
 namespace BCC\Disputes\Services;
 
+use BCC\Disputes\Repositories\DisputeRepository;
 use WP_User;
 
 if (!defined('ABSPATH')) {
@@ -20,12 +21,12 @@ class DisputeNotificationService
             self::notifyPanelist($uid, $dispute_id, $page_id);
         }, 10, 3);
 
-        add_action('bcc_disputes_email_reported_user', function (int $reported_user_id) {
+        add_action('bcc_disputes_email_reported_user', function (int $report_id, int $reported_user_id) {
             $user = get_userdata($reported_user_id);
             if ($user) {
-                self::emailReportedUser($user);
+                self::emailReportedUser($report_id, $user);
             }
-        }, 10, 1);
+        }, 10, 2);
 
         add_action('bcc_disputes_email_admin_report', function (int $report_id, int $reporter_id, int $reported_user_id, string $reason_key, string $reason_detail) {
             $reported_user = get_userdata($reported_user_id);
@@ -34,9 +35,9 @@ class DisputeNotificationService
             }
         }, 10, 5);
 
-        add_action('bcc_disputes_email_reporter_result', function (int $reporter_id, string $outcome) {
-            self::emailReporterResult($reporter_id, $outcome);
-        }, 10, 2);
+        add_action('bcc_disputes_email_reporter_result', function (int $dispute_id, int $reporter_id, string $outcome) {
+            self::emailReporterResult($dispute_id, $reporter_id, $outcome);
+        }, 10, 3);
     }
 
     /**
@@ -54,6 +55,13 @@ class DisputeNotificationService
 
     public static function notifyPanelist(int $uid, int $dispute_id, int $page_id): void
     {
+        // Idempotency gate: only send if notified_at is still NULL.
+        // markPanelistNotified atomically sets the timestamp and returns
+        // false if already set, preventing duplicate emails on retries.
+        if (!DisputeRepository::markPanelistNotified($dispute_id, $uid)) {
+            return;
+        }
+
         $user = get_userdata($uid);
         if (!$user || !$user->user_email) {
             return;
@@ -70,8 +78,11 @@ class DisputeNotificationService
         wp_mail($user->user_email, $subject, $body);
     }
 
-    public static function emailReportedUser(WP_User $reported_user): void
+    public static function emailReportedUser(int $report_id, WP_User $reported_user): void
     {
+        if (!DisputeRepository::markReportNotified($report_id)) {
+            return; // Already sent.
+        }
         $site_name = get_bloginfo('name');
         $subject   = sprintf('[%s] Your account has received a report', $site_name);
         $body      = sprintf(
@@ -85,6 +96,13 @@ class DisputeNotificationService
 
     public static function emailAdminReport(int $report_id, int $reporter_id, WP_User $reported_user, string $reason_key, string $reason_detail): void
     {
+        // Idempotency gate: prevent duplicate admin emails on retry/overlap.
+        $lock_key = 'bcc_admin_report_sent_' . $report_id;
+        if (get_transient($lock_key)) {
+            return;
+        }
+        set_transient($lock_key, 1, DAY_IN_SECONDS);
+
         $admin_email   = get_option('admin_email');
         $site_name     = get_bloginfo('name');
         $reporter      = get_userdata($reporter_id);
@@ -125,7 +143,7 @@ class DisputeNotificationService
             "Review this report in the admin dashboard:\n%s\n",
             $site_name,
             $report_id,
-            current_time('mysql'),
+            gmdate('Y-m-d H:i:s'),
             $reported_user->ID,
             $reported_user->display_name,
             $reported_user->user_email,
@@ -141,8 +159,12 @@ class DisputeNotificationService
         wp_mail($admin_email, $subject, $body);
     }
 
-    public static function emailReporterResult(int $reporterId, string $outcome): void
+    public static function emailReporterResult(int $disputeId, int $reporterId, string $outcome): void
     {
+        if (!DisputeRepository::markResolvedNotified($disputeId)) {
+            return; // Already sent.
+        }
+
         $reporter = get_userdata($reporterId);
         if (!$reporter || !$reporter->user_email) {
             return;

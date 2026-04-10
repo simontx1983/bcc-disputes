@@ -6,10 +6,9 @@ use BCC\Core\Contracts\TrustReadServiceInterface;
 use BCC\Core\Log\Logger as CoreLogger;
 use BCC\Core\Permissions\Permissions;
 use BCC\Core\ServiceLocator;
-use BCC\Disputes\Application\Disputes\ResolveDisputeService;
+use BCC\Disputes\Services\ResolveDisputeService;
 use BCC\Disputes\Repositories\DisputeRepository;
 use BCC\Disputes\Services\DisputeNotificationService;
-use BCC\Disputes\Support\Logger;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_REST_Server;
@@ -131,13 +130,14 @@ class DisputeController
             return $this->error('already_disputed', 'This vote already has an active dispute.', 409);
         }
 
-        // Max 3 disputes per page per 30 days — prevents brute-force dispute spam.
-        if (DisputeRepository::countRecentDisputesForPage($page_id, 30) >= 3) {
-            return $this->error('dispute_limit_reached', 'This page has reached its dispute limit. Please try again later.', 429);
-        }
-
-        // Insert dispute + panelists atomically
+        // Insert dispute + panelists atomically (includes FOR UPDATE limit check)
         $panelists = $this->selectPanelists($current_user_id, $voter_id);
+
+        if (count($panelists) < BCC_DISPUTES_PANEL_SIZE) {
+            return $this->error('insufficient_panelists',
+                'Cannot create dispute — not enough eligible panelists available. The system requires at least '
+                . BCC_DISPUTES_PANEL_SIZE . ' independent panelists.', 503);
+        }
 
         $result = DisputeRepository::createDisputeWithPanel([
             'vote_id'      => $vote_id,
@@ -157,8 +157,11 @@ class DisputeController
             if ($result['db_error'] === 'dispute_limit_reached') {
                 return $this->error('dispute_limit_reached', 'This page has reached its dispute limit. Please try again later.', 429);
             }
+            if ($result['db_error'] === 'already_disputed') {
+                return $this->error('already_disputed', 'This vote already has an active dispute.', 409);
+            }
             if ($result['failed_panelist'] !== null) {
-                Logger::logFailure('panel_insert_failed', [
+                CoreLogger::error('[bcc-disputes] ' .'panel_insert_failed', [
                     'panelist_id' => $result['failed_panelist'],
                     'db_error'    => $result['db_error'],
                 ]);
@@ -193,7 +196,7 @@ class DisputeController
         }
 
         if (!ServiceLocator::hasRealService(TrustReadServiceInterface::class)) {
-            Logger::logFailure('trust_read_service_missing', [
+            CoreLogger::error('[bcc-disputes] ' .'trust_read_service_missing', [
                 'page_id' => $page_id,
                 'operation' => 'list_votes',
             ]);
@@ -237,9 +240,10 @@ class DisputeController
         $page     = max(1, (int) $req->get_param('page'));
         $per_page = min(100, max(1, (int) ($req->get_param('per_page') ?: 20)));
         $offset   = ($page - 1) * $per_page;
+        $page_id  = $req->get_param('page_id') !== null ? (int) $req->get_param('page_id') : null;
 
-        $total = DisputeRepository::countByReporter($userId);
-        $rows  = DisputeRepository::getByReporterPaginated($userId, $per_page, $offset);
+        $total = DisputeRepository::countByReporter($userId, $page_id);
+        $rows  = DisputeRepository::getByReporterPaginated($userId, $per_page, $offset, $page_id);
 
         $response = rest_ensure_response(array_map([$this, 'formatDispute'], $rows));
         $response->header('X-WP-Total', (string) $total);
@@ -274,6 +278,9 @@ class DisputeController
         $note       = $req->get_param('note') ?? '';
         $userId     = get_current_user_id();
 
+        $throttled = $this->throttle('dispute_vote', $userId, 10);
+        if ($throttled) return $throttled;
+
         if (!in_array($decision, ['accept', 'reject'], true)) {
             return $this->error('invalid_decision', 'Decision must be accept or reject.', 400);
         }
@@ -288,7 +295,7 @@ class DisputeController
         }
 
         $dispute = DisputeRepository::getDisputeById($dispute_id);
-        if (!$dispute || !in_array($dispute->status, ['pending', 'reviewing'], true)) {
+        if (!$dispute || $dispute->status !== 'reviewing') {
             return $this->error('dispute_closed', 'This dispute is no longer open.', 410);
         }
 
@@ -297,7 +304,7 @@ class DisputeController
 
         if ($result['status'] !== 'success') {
             if (isset($result['db_error'])) {
-                Logger::logFailure('cast_vote_rollback', [
+                CoreLogger::error('[bcc-disputes] ' .'cast_vote_rollback', [
                     'dispute_id' => $dispute_id,
                     'user_id'    => $userId,
                     'step'       => $result['step'] ?? 'unknown',
@@ -319,7 +326,7 @@ class DisputeController
 
         // Resolve outside the transaction. Multiple concurrent voters may
         // evaluate $should_resolve = true; ResolveDisputeService is the
-        // authoritative idempotency gate (WHERE status IN ('pending','reviewing')).
+        // authoritative idempotency gate (WHERE status = 'reviewing').
         if ($should_resolve) {
             $final = $accepts > $rejects ? 'accepted' : 'rejected';
             $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $final);
@@ -349,7 +356,7 @@ class DisputeController
             return $this->error('not_found', 'Dispute not found.', 404);
         }
 
-        if (!in_array($dispute->status, ['pending', 'reviewing'], true)) {
+        if ($dispute->status !== 'reviewing') {
             return $this->error('already_resolved', 'This dispute has already been resolved.', 409);
         }
 
@@ -362,11 +369,11 @@ class DisputeController
         return rest_ensure_response(['message' => 'Dispute resolved as ' . $decision . '.']);
     }
 
-    // ── Resolution logic ──────────────────────────────────────────────────────
+    // ── Resolution ────────────────────────────────────────────────────────────
 
-    public function resolve(int $dispute_id, int $vote_id, int $page_id, int $voter_id, int $reporter_id, string $outcome): bool
+    private function resolve(int $disputeId, int $voteId, int $pageId, int $voterId, int $reporterId, string $outcome): bool
     {
-        return (new ResolveDisputeService())->handle($dispute_id, $vote_id, $page_id, $voter_id, $reporter_id, $outcome);
+        return (new ResolveDisputeService())->handle($disputeId, $voteId, $pageId, $voterId, $reporterId, $outcome, get_current_user_id());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -374,7 +381,7 @@ class DisputeController
     private function getVote(int $vote_id): ?object
     {
         if (!ServiceLocator::hasRealService(TrustReadServiceInterface::class)) {
-            Logger::logFailure('trust_read_service_missing', [
+            CoreLogger::error('[bcc-disputes] ' .'trust_read_service_missing', [
                 'vote_id' => $vote_id,
             ]);
             return null;
@@ -395,7 +402,7 @@ class DisputeController
         $needed = BCC_DISPUTES_PANEL_SIZE;
 
         if (!ServiceLocator::hasRealService(TrustReadServiceInterface::class)) {
-            Logger::logFailure('trust_read_service_missing', [
+            CoreLogger::error('[bcc-disputes] ' .'trust_read_service_missing', [
                 'reporter_id' => $reporter_id,
                 'voter_id' => $voter_id,
                 'operation' => 'select_panelists',
@@ -410,7 +417,7 @@ class DisputeController
 
     private function formatDispute(object $d): array
     {
-        return [
+        $data = [
             'id'            => (int) $d->id,
             'vote_id'       => (int) $d->vote_id,
             'page_id'       => (int) $d->page_id,
@@ -427,6 +434,21 @@ class DisputeController
             'created_at'    => $d->created_at,
             'resolved_at'   => $d->resolved_at ?? null,
         ];
+
+        // Hide reporter identity and vote tallies from panelists who
+        // have not yet cast their vote to enforce independent deliberation.
+        $userId = get_current_user_id();
+        $isPanelist = property_exists($d, 'my_decision');
+        $isReporter = (int) $d->reporter_id === $userId;
+        $isAdmin    = current_user_can('manage_options');
+
+        if ($isPanelist && !$isReporter && !$isAdmin && $data['my_decision'] === null) {
+            $data['reporter_name'] = null;
+            $data['accepts']       = null;
+            $data['rejects']       = null;
+        }
+
+        return $data;
     }
 
     // ── Report user ───────────────────────────────────────────────────────────
@@ -455,13 +477,21 @@ class DisputeController
             return $this->error('detail_required', 'Please provide at least 10 characters describing your reason.', 400);
         }
 
+        if ( DisputeRepository::countRecentReportsByReporter($reporter_id) >= 5 ) {
+            return $this->error('report_limit_reached', 'You have reached the daily report limit. Please try again later.', 429);
+        }
+
+        if ( DisputeRepository::hasActiveReport($reporter_id, $reported_id) ) {
+            return $this->error('already_reported', 'You have already submitted an active report against this user.', 409);
+        }
+
         $report_id = DisputeRepository::createReport($reported_id, $reporter_id, $reason_key, $reason_detail);
         if ( ! $report_id ) {
             return $this->error('db_error', 'Failed to submit report.', 500);
         }
 
         // Emails queued async — never block the REST response with SMTP.
-        DisputeNotificationService::enqueueAsync('bcc_disputes_email_reported_user', [$reported_id]);
+        DisputeNotificationService::enqueueAsync('bcc_disputes_email_reported_user', [$report_id, $reported_id]);
         DisputeNotificationService::enqueueAsync('bcc_disputes_email_admin_report', [$report_id, $reporter_id, $reported_id, $reason_key, $reason_detail]);
 
         CoreLogger::audit('user_reported', ['reporter' => $reporter_id, 'reported' => $reported_id, 'reason' => $reason_key]);
@@ -482,17 +512,8 @@ class DisputeController
      */
     private function throttle(string $action, int $user_id, int $cooldown_seconds = 60): ?WP_REST_Response
     {
-        $key = "bcc_throttle_{$action}_{$user_id}";
-
-        if (class_exists('\\BCC\\Trust\\Security\\RateLimiter')) {
-            $allowed = \BCC\Trust\Security\RateLimiter::allowByKey($key, 1, $cooldown_seconds);
-        } else {
-            // Fallback: simple transient-based throttle
-            $allowed = !get_transient($key);
-            if ($allowed) {
-                set_transient($key, 1, $cooldown_seconds);
-            }
-        }
+        $key     = "bcc_throttle_{$action}_{$user_id}";
+        $allowed = \BCC\Core\Security\Throttle::allow($action, 1, $cooldown_seconds, $key);
 
         if (!$allowed) {
             return $this->error(

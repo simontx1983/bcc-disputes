@@ -46,9 +46,11 @@ require_once $bcc_disputes_autoloader;
 
 require_once BCC_DISPUTES_PATH . 'includes/blocks.php';
 
-if (is_admin()) {
-    \BCC\Disputes\Admin\DisputeAdmin::boot();
-}
+add_action('plugins_loaded', function () {
+    if (is_admin()) {
+        \BCC\Disputes\Admin\DisputeAdmin::boot();
+    }
+}, 15);
 
 // ── Activation: install tables + schedule cron ───────────────────────────────
 register_activation_hook(__FILE__, function () {
@@ -67,7 +69,7 @@ add_action('init', function () {
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 add_action('rest_api_init', function () {
-    \BCC\Disputes\Plugin::instance()->controller()->register_routes();
+    (new \BCC\Disputes\Controllers\DisputeController())->register_routes();
 });
 
 add_action('wp_enqueue_scripts', function () {

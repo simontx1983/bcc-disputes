@@ -21,6 +21,12 @@
         return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
+    function safeUrl(url) {
+        if (!url) return '#';
+        try { const u = new URL(url, location.origin); return /^https?:$/.test(u.protocol) ? escHtml(url) : '#'; }
+        catch (_) { return '#'; }
+    }
+
     function badgeHtml(status) {
         return `<span class="bcc-dispute-badge bcc-dispute-badge--${escHtml(status)}">${escHtml(status)}</span>`;
     }
@@ -80,6 +86,7 @@
                         submitPanel.removeAttribute('hidden');
                         submitPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
                         el.querySelector('.bcc-dispute-status').textContent = '';
+                        el.querySelector('#bcc-dispute-submit').disabled = false;
                     });
                 });
             })
@@ -130,9 +137,9 @@
 
         // ── Load history ────────────────────────────────────────────────────
         function loadHistory() {
-            apiFetch(`${BASE}/mine`)
+            apiFetch(`${BASE}/mine?page_id=${pageId}`)
                 .then(disputes => {
-                    const mine = disputes.filter(d => String(d.page_id) === String(pageId));
+                    const mine = disputes;
                     if (!mine.length) {
                         historyList.innerHTML = '<p class="bcc-dispute-empty">No disputes yet.</p>';
                         return;
@@ -145,7 +152,7 @@
                                 <span class="bcc-dispute-card__date">${relativeDate(d.created_at)}</span>
                             </div>
                             <div class="bcc-dispute-card__reason">${escHtml(d.reason)}</div>
-                            ${d.evidence_url ? `<a class="bcc-dispute-card__evidence" href="${escHtml(d.evidence_url)}" target="_blank" rel="noopener">View evidence →</a>` : ''}
+                            ${d.evidence_url ? `<a class="bcc-dispute-card__evidence" href="${safeUrl(d.evidence_url)}" target="_blank" rel="noopener">View evidence →</a>` : ''}
                             <div class="bcc-dispute-card__tally">Panel: ${d.accepts} accept · ${d.rejects} reject (of ${d.panel_size})</div>
                         </div>
                     `).join('');
@@ -177,8 +184,8 @@
                             <span class="bcc-dispute-card__date">${relativeDate(d.created_at)}</span>
                         </div>
                         <div class="bcc-dispute-card__reason">${escHtml(d.reason)}</div>
-                        ${d.evidence_url ? `<a class="bcc-dispute-card__evidence" href="${escHtml(d.evidence_url)}" target="_blank" rel="noopener">View evidence →</a>` : ''}
-                        <div class="bcc-dispute-card__tally">Current tally: ${d.accepts} accept · ${d.rejects} reject (panel of ${d.panel_size})</div>
+                        ${d.evidence_url ? `<a class="bcc-dispute-card__evidence" href="${safeUrl(d.evidence_url)}" target="_blank" rel="noopener">View evidence →</a>` : ''}
+                        <div class="bcc-dispute-card__tally">${d.accepts !== null ? `Current tally: ${d.accepts} accept · ${d.rejects} reject (panel of ${d.panel_size})` : `Panel of ${d.panel_size} — vote to see tally`}</div>
                         ${d.my_decision
                             ? `<p class="bcc-dispute-already-voted">You voted: <strong>${escHtml(d.my_decision)}</strong></p>`
                             : `<div class="bcc-dispute-panel-actions">
@@ -197,7 +204,7 @@
                         const card      = btn.closest('.bcc-dispute-card');
                         const statusEl  = card.querySelector('.bcc-dispute-status');
 
-                        btn.disabled = true;
+                        card.querySelectorAll('.js-panel-vote').forEach(b => b.disabled = true);
                         if (statusEl) { statusEl.textContent = 'Submitting…'; statusEl.className = 'bcc-dispute-status'; }
 
                         apiFetch(`${BASE}/${disputeId}/vote`, {

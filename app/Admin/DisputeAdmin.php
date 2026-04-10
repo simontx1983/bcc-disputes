@@ -2,7 +2,7 @@
 
 namespace BCC\Disputes\Admin;
 
-use BCC\Disputes\Plugin;
+use BCC\Disputes\Services\ResolveDisputeService;
 use BCC\Disputes\Repositories\DisputeRepository;
 
 if (!defined('ABSPATH')) {
@@ -99,7 +99,7 @@ class DisputeAdmin
         $panelists = DisputeRepository::getPanelistsForDispute($dispute_id);
 
         $back_url = admin_url('admin.php?page=bcc-disputes');
-        $is_open  = in_array($dispute->status, ['pending', 'reviewing'], true);
+        $is_open  = $dispute->status === 'reviewing';
 
         echo '<div class="wrap">';
 
@@ -185,7 +185,6 @@ class DisputeAdmin
         echo '<table class="widefat striped" style="border:none;">';
 
         $status_colors = [
-            'pending'   => '#ed6c02',
             'reviewing' => '#0288d1',
             'accepted'  => '#2e7d32',
             'rejected'  => '#c62828',
@@ -251,9 +250,6 @@ class DisputeAdmin
             // Reject form
             self::action_button($dispute_id, 'rejected', __('Reject Dispute', 'bcc-disputes'), 'button-secondary');
 
-            // Force remove vote
-            self::action_button($dispute_id, 'force_remove', __('Force Remove Vote', 'bcc-disputes'), 'button-link-delete');
-
             echo '</div>';
             echo '</div>';
         }
@@ -291,19 +287,14 @@ class DisputeAdmin
         }
 
         // Prevent re-resolving already-resolved disputes
-        if (!in_array($dispute->status, ['pending', 'reviewing'], true)) {
+        if ($dispute->status !== 'reviewing') {
             return;
         }
 
-        $api = Plugin::instance()->controller();
         $success = false;
 
         if ($action === 'accepted' || $action === 'rejected') {
-            $success = $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $action);
-        } elseif ($action === 'force_remove') {
-            // Accept the dispute (removes vote + penalises voter)
-            $success = $api->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, 'accepted');
-            $action = 'accepted';
+            $success = (new ResolveDisputeService())->handle($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $action);
         }
 
         $query_args = ['page' => 'bcc-disputes', 'dispute_id' => $dispute_id];
@@ -399,14 +390,10 @@ class DisputeAdmin
         $update_ok = DisputeRepository::updateReportStatus($report_id, $action);
 
         if (!$update_ok) {
-            if (class_exists('BCC\\Core\\Log\\Logger')) {
-                \BCC\Core\Log\Logger::error('[Disputes] report_action_failed', [
-                    'report_id' => $report_id,
-                    'action'    => $action,
-                ]);
-            } else {
-                error_log('[BCC Disputes] report_action_failed report_id=' . $report_id);
-            }
+            \BCC\Core\Log\Logger::error('[Disputes] report_action_failed', [
+                'report_id' => $report_id,
+                'action'    => $action,
+            ]);
             wp_die(__('Failed to update report.', 'bcc-disputes'));
         }
 

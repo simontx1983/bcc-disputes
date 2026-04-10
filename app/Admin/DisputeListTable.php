@@ -65,7 +65,7 @@ class DisputeListTable extends WP_List_Table
             $total
         );
 
-        foreach (['pending', 'reviewing', 'accepted', 'rejected'] as $s) {
+        foreach (['reviewing', 'accepted', 'rejected'] as $s) {
             $c = $counts[$s] ?? 0;
             $views[$s] = sprintf(
                 '<a href="%s" class="%s">%s <span class="count">(%d)</span></a>',
@@ -83,7 +83,7 @@ class DisputeListTable extends WP_List_Table
     {
         // Filters
         $status_filter = isset($_GET['dispute_status']) ? sanitize_key($_GET['dispute_status']) : '';
-        if (!in_array($status_filter, ['pending', 'reviewing', 'accepted', 'rejected'], true)) {
+        if (!in_array($status_filter, ['reviewing', 'accepted', 'rejected'], true)) {
             $status_filter = '';
         }
 
@@ -176,7 +176,6 @@ class DisputeListTable extends WP_List_Table
 
             case 'status':
                 $colors = [
-                    'pending'   => '#ed6c02',
                     'reviewing' => '#0288d1',
                     'accepted'  => '#2e7d32',
                     'rejected'  => '#c62828',

@@ -2,7 +2,7 @@
 
 namespace BCC\Disputes\Services;
 
-use BCC\Disputes\Plugin;
+use BCC\Disputes\Services\ResolveDisputeService;
 use BCC\Disputes\Repositories\DisputeRepository;
 
 if (!defined('ABSPATH')) {
@@ -34,9 +34,9 @@ class DisputeScheduler
     /**
      * Async handler: resolve a single dispute outside the cron loop.
      */
-    public static function handleAsyncResolve(int $dispute_id, int $vote_id, int $page_id, int $voter_id, int $reporter_id, string $outcome): void
+    public static function handleAsyncResolve($dispute_id, $vote_id, $page_id, $voter_id, $reporter_id, $outcome): void
     {
-        Plugin::instance()->controller()->resolve($dispute_id, $vote_id, $page_id, $voter_id, $reporter_id, $outcome);
+        (new ResolveDisputeService())->handle((int) $dispute_id, (int) $vote_id, (int) $page_id, (int) $voter_id, (int) $reporter_id, (string) $outcome, null);
     }
 
     /**
@@ -46,7 +46,22 @@ class DisputeScheduler
      */
     public static function auto_resolve_expired(): void
     {
-        $cutoff  = gmdate('Y-m-d H:i:s', current_time('timestamp', true) - (BCC_DISPUTES_TTL_DAYS * DAY_IN_SECONDS));
+        // Advisory lock prevents overlapping cron runs from processing
+        // the same expired disputes concurrently.
+        if (!DisputeRepository::acquireAutoResolveLock()) {
+            return;
+        }
+
+        try {
+            self::doAutoResolve();
+        } finally {
+            DisputeRepository::releaseAutoResolveLock();
+        }
+    }
+
+    private static function doAutoResolve(): void
+    {
+        $cutoff  = gmdate('Y-m-d H:i:s', time() - (BCC_DISPUTES_TTL_DAYS * DAY_IN_SECONDS));
         $expired = DisputeRepository::getExpiredDisputes($cutoff, 50);
 
         if (empty($expired)) {

@@ -19,6 +19,15 @@ class DisputeRepository
     /** TTL for data that changes less often (individual dispute lookups). */
     private const TTL_WARM = 300;
 
+    /** Dispute table columns. */
+    private const DISPUTE_COLUMNS = 'id, vote_id, page_id, reporter_id, voter_id, reason, evidence_url, status, panel_accepts, panel_rejects, panel_size, created_at, resolved_at';
+
+    /** Panel table columns. */
+    private const PANEL_COLUMNS = 'id, dispute_id, panelist_user_id, decision, note, assigned_at, voted_at, notified_at';
+
+    /** User reports table columns. */
+    private const REPORT_COLUMNS = 'id, reported_id, reporter_id, reason_key, reason_detail, status, created_at, reviewed_at';
+
     public static function disputes_table(): string
     {
         return DB::table('disputes');
@@ -78,29 +87,33 @@ class DisputeRepository
         }
     }
 
-    // ── Query methods ────────────────────────────────────────────────────────
+    // ── Advisory locks ────────────────────────────────────────────────────────
 
     /**
-     * Count disputes filed for a page within the last N days.
+     * Acquire a MySQL advisory lock for auto-resolve cron.
      *
-     * Used to enforce per-page dispute limits (e.g., max 3 per 30 days)
-     * to prevent brute-force dispute spam.
+     * GET_LOCK returns 1 if acquired, 0 if already held by another connection.
+     * Timeout of 0 means non-blocking (return immediately if unavailable).
      */
-    public static function countRecentDisputesForPage(int $pageId, int $days = 30): int
+    public static function acquireAutoResolveLock(): bool
     {
         global $wpdb;
-        $table = self::disputes_table();
-
-        return (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$table}
-             WHERE page_id = %d
-               AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)",
-            $pageId, $days
-        ));
+        return (int) $wpdb->get_var("SELECT GET_LOCK('bcc_disputes_auto_resolve', 0)") === 1;
     }
 
     /**
-     * Check whether an active (pending/reviewing) dispute already exists for a vote.
+     * Release the auto-resolve advisory lock.
+     */
+    public static function releaseAutoResolveLock(): void
+    {
+        global $wpdb;
+        $wpdb->query("SELECT RELEASE_LOCK('bcc_disputes_auto_resolve')");
+    }
+
+    // ── Query methods ────────────────────────────────────────────────────────
+
+    /**
+     * Check whether an active (reviewing) dispute already exists for a vote.
      */
     public static function hasActiveDisputeForVote(int $voteId): bool
     {
@@ -108,7 +121,7 @@ class DisputeRepository
         $table = self::disputes_table();
 
         $existing = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$table} WHERE vote_id = %d AND status IN ('pending','reviewing') LIMIT 1",
+            "SELECT id FROM {$table} WHERE vote_id = %d AND status = 'reviewing' LIMIT 1",
             $voteId
         ));
 
@@ -145,6 +158,21 @@ class DisputeRepository
             return ['id' => null, 'failed_panelist' => null, 'db_error' => 'dispute_limit_reached'];
         }
 
+        // Atomic duplicate check: verify no active dispute exists for this
+        // vote_id while holding the FOR UPDATE lock. Prevents race where two
+        // concurrent submissions both pass the controller-level check.
+        $voteId = (int) $disputeData['vote_id'];
+        $existingForVote = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$disputeTable}
+             WHERE vote_id = %d AND status = 'reviewing'
+             LIMIT 1",
+            $voteId
+        ));
+        if ($existingForVote) {
+            $wpdb->query('ROLLBACK');
+            return ['id' => null, 'failed_panelist' => null, 'db_error' => 'already_disputed'];
+        }
+
         $wpdb->insert($disputeTable, [
             'vote_id'      => $disputeData['vote_id'],
             'page_id'      => $disputeData['page_id'],
@@ -178,11 +206,12 @@ class DisputeRepository
 
         $wpdb->query('COMMIT');
 
-        // Invalidate: each panelist's queue cache, reporter's dispute list.
+        // Invalidate: each panelist's queue cache, reporter's dispute list, status counts.
         foreach ($panelistIds as $uid) {
             self::bumpGeneration("panel_q_gen:{$uid}");
         }
         self::bumpGeneration("reporter_gen:{$disputeData['reporter_id']}");
+        wp_cache_delete('dispute_status_counts', self::CACHE_GROUP);
 
         return ['id' => $dispute_id, 'failed_panelist' => null, 'db_error' => null];
     }
@@ -215,7 +244,7 @@ class DisputeRepository
             "SELECT DISTINCT vote_id
              FROM {$table}
              WHERE vote_id IN ({$placeholders})
-               AND status IN ('pending','reviewing','accepted')",
+               AND status IN ('reviewing','accepted')",
             ...$voteIds
         ));
 
@@ -227,10 +256,11 @@ class DisputeRepository
     /**
      * Count disputes filed by a user.
      */
-    public static function countByReporter(int $userId): int
+    public static function countByReporter(int $userId, ?int $pageId = null): int
     {
+        $pageSuffix = $pageId !== null ? ":{$pageId}" : '';
         $gen      = self::getGeneration("reporter_gen:{$userId}");
-        $cacheKey = "reporter_count:{$userId}:{$gen}";
+        $cacheKey = "reporter_count:{$userId}:{$gen}{$pageSuffix}";
         $cached   = wp_cache_get($cacheKey, self::CACHE_GROUP);
         if ($cached !== false) {
             return (int) $cached;
@@ -239,9 +269,17 @@ class DisputeRepository
         global $wpdb;
         $table = self::disputes_table();
 
+        $where  = "reporter_id = %d";
+        $params = [$userId];
+
+        if ($pageId !== null) {
+            $where   .= " AND page_id = %d";
+            $params[] = $pageId;
+        }
+
         $count = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$table} WHERE reporter_id = %d",
-            $userId
+            "SELECT COUNT(*) FROM {$table} WHERE {$where}",
+            ...$params
         ));
 
         wp_cache_set($cacheKey, $count, self::CACHE_GROUP, self::TTL_HOT);
@@ -253,10 +291,11 @@ class DisputeRepository
      *
      * @return object[]
      */
-    public static function getByReporterPaginated(int $userId, int $limit, int $offset): array
+    public static function getByReporterPaginated(int $userId, int $limit, int $offset, ?int $pageId = null): array
     {
+        $pageSuffix = $pageId !== null ? ":{$pageId}" : '';
         $gen      = self::getGeneration("reporter_gen:{$userId}");
-        $cacheKey = "reporter:{$userId}:{$gen}:{$limit}:{$offset}";
+        $cacheKey = "reporter:{$userId}:{$gen}:{$limit}:{$offset}{$pageSuffix}";
         $cached   = wp_cache_get($cacheKey, self::CACHE_GROUP);
         if ($cached !== false) {
             return $cached;
@@ -264,6 +303,17 @@ class DisputeRepository
 
         global $wpdb;
         $table = self::disputes_table();
+
+        $where  = "d.reporter_id = %d";
+        $params = [$userId];
+
+        if ($pageId !== null) {
+            $where   .= " AND d.page_id = %d";
+            $params[] = $pageId;
+        }
+
+        $params[] = $limit;
+        $params[] = $offset;
 
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT d.id, d.vote_id, d.page_id, d.reason, d.evidence_url, d.status,
@@ -276,10 +326,10 @@ class DisputeRepository
              LEFT JOIN {$wpdb->posts} p ON d.page_id = p.ID
              LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
              LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
-             WHERE d.reporter_id = %d
+             WHERE {$where}
              ORDER BY d.created_at DESC
              LIMIT %d OFFSET %d",
-            $userId, $limit, $offset
+            ...$params
         ));
 
         $result = $rows ?: [];
@@ -307,7 +357,7 @@ class DisputeRepository
             "SELECT COUNT(*)
              FROM {$panelTable} pan
              JOIN {$disputeTable} d ON d.id = pan.dispute_id
-             WHERE pan.panelist_user_id = %d AND d.status IN ('pending','reviewing')",
+             WHERE pan.panelist_user_id = %d AND d.status = 'reviewing'",
             $userId
         ));
 
@@ -347,7 +397,7 @@ class DisputeRepository
              LEFT JOIN {$wpdb->users} u ON d.voter_id = u.ID
              LEFT JOIN {$wpdb->users} r ON d.reporter_id = r.ID
              WHERE pan.panelist_user_id = %d
-               AND d.status IN ('pending','reviewing')
+               AND d.status = 'reviewing'
              ORDER BY d.created_at ASC
              LIMIT %d OFFSET %d",
             $userId, $limit, $offset
@@ -433,7 +483,7 @@ class DisputeRepository
             $disputeId
         ));
 
-        if (!$dispute || !in_array($dispute->status, ['pending', 'reviewing'], true)) {
+        if (!$dispute || $dispute->status !== 'reviewing') {
             $wpdb->query('ROLLBACK');
             return ['status' => 'error', 'code' => 'dispute_closed', 'message' => 'This dispute is no longer open.', 'http' => 410, 'dispute' => null, 'accepts' => 0, 'rejects' => 0];
         }
@@ -442,7 +492,7 @@ class DisputeRepository
         $voted = $wpdb->query($wpdb->prepare(
             "UPDATE {$panelTable} SET decision = %s, note = %s, voted_at = %s
              WHERE dispute_id = %d AND panelist_user_id = %d AND decision IS NULL",
-            $decision, $note, current_time('mysql'), $disputeId, $userId
+            $decision, $note, gmdate('Y-m-d H:i:s'), $disputeId, $userId
         ));
 
         if ($voted === false) {
@@ -489,6 +539,40 @@ class DisputeRepository
             'accepts' => (int) $dispute->panel_accepts,
             'rejects' => (int) $dispute->panel_rejects,
         ];
+    }
+
+    /**
+     * Check whether an active (open) report already exists from reporter to reported user.
+     */
+    public static function hasActiveReport(int $reporterId, int $reportedId): bool
+    {
+        global $wpdb;
+        $table = self::user_reports_table();
+
+        $existing = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$table}
+             WHERE reporter_id = %d AND reported_id = %d AND status = 'open'
+             LIMIT 1",
+            $reporterId, $reportedId
+        ));
+
+        return (bool) $existing;
+    }
+
+    /**
+     * Count reports submitted by a user within the last 24 hours.
+     */
+    public static function countRecentReportsByReporter(int $reporterId): int
+    {
+        global $wpdb;
+        $table = self::user_reports_table();
+
+        return (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE reporter_id = %d
+               AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 24 HOUR)",
+            $reporterId
+        ));
     }
 
     /**
@@ -767,24 +851,67 @@ class DisputeRepository
      *
      * @return bool True on success, false on DB error.
      */
+    /**
+     * Transition a report from 'open' to the given status.
+     *
+     * The WHERE clause includes `status = 'open'` to prevent invalid
+     * state transitions (e.g., dismissed -> reviewed).
+     *
+     * @return bool True if exactly one row was updated, false otherwise.
+     */
     public static function updateReportStatus(int $reportId, string $status): bool
     {
         global $wpdb;
         $table = self::user_reports_table();
 
-        $result = $wpdb->update(
-            $table,
-            ['status' => $status, 'reviewed_at' => current_time('mysql')],
-            ['id' => $reportId],
-            ['%s', '%s'],
-            ['%d']
-        );
+        $result = $wpdb->query($wpdb->prepare(
+            "UPDATE {$table} SET status = %s, reviewed_at = %s WHERE id = %d AND status = 'open'",
+            $status,
+            gmdate('Y-m-d H:i:s'),
+            $reportId
+        ));
 
-        if ($result !== false) {
+        if ($result !== false && $result > 0) {
             wp_cache_delete('report_status_counts', self::CACHE_GROUP);
         }
 
-        return $result !== false;
+        return $result !== false && $result > 0;
+    }
+
+    /**
+     * Atomically mark a dispute's resolution email as sent.
+     * Returns true only if the flag was NULL (first call wins).
+     */
+    public static function markResolvedNotified(int $disputeId): bool
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        $affected = $wpdb->query($wpdb->prepare(
+            "UPDATE {$table} SET resolved_notified_at = %s WHERE id = %d AND resolved_notified_at IS NULL",
+            gmdate('Y-m-d H:i:s'),
+            $disputeId
+        ));
+
+        return $affected > 0;
+    }
+
+    /**
+     * Atomically mark a report's notification as sent.
+     * Returns true only if the flag was NULL (first call wins).
+     */
+    public static function markReportNotified(int $reportId): bool
+    {
+        global $wpdb;
+        $table = self::user_reports_table();
+
+        $affected = $wpdb->query($wpdb->prepare(
+            "UPDATE {$table} SET notified_at = %s WHERE id = %d AND notified_at IS NULL",
+            gmdate('Y-m-d H:i:s'),
+            $reportId
+        ));
+
+        return $affected > 0;
     }
 
     // ── Scheduler query methods ─────────────────────────────────────────────
@@ -802,7 +929,7 @@ class DisputeRepository
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT id, panel_accepts, panel_rejects, vote_id, page_id, voter_id, reporter_id
              FROM {$table}
-             WHERE status IN ('pending','reviewing')
+             WHERE status = 'reviewing'
                AND created_at <= %s
              ORDER BY created_at ASC
              LIMIT %d",
@@ -831,9 +958,9 @@ class DisputeRepository
 
         $result = $wpdb->query($wpdb->prepare(
             "UPDATE {$table} SET status = %s, resolved_at = %s
-             WHERE id = %d AND status IN ('pending','reviewing')",
+             WHERE id = %d AND status = 'reviewing'",
             $outcome,
-            current_time('mysql'),
+            gmdate('Y-m-d H:i:s'),
             $disputeId
         ));
 
@@ -933,6 +1060,29 @@ class DisputeRepository
         }
     }
 
+    // ── Notification idempotency ───────────────────────────────────────────
+
+    /**
+     * Atomically mark a panelist as notified, returning true only if the
+     * row was updated (i.e., notified_at was previously NULL). This
+     * prevents duplicate email sends across retries or queue replays.
+     */
+    public static function markPanelistNotified(int $disputeId, int $panelistUserId): bool
+    {
+        global $wpdb;
+        $table = self::panel_table();
+
+        $affected = $wpdb->query($wpdb->prepare(
+            "UPDATE {$table} SET notified_at = %s
+             WHERE dispute_id = %d AND panelist_user_id = %d AND notified_at IS NULL",
+            gmdate('Y-m-d H:i:s'),
+            $disputeId,
+            $panelistUserId
+        ));
+
+        return $affected !== false && $affected > 0;
+    }
+
     // ── Schema installation ──────────────────────────────────────────────────
 
     public static function install(): void
@@ -957,7 +1107,8 @@ class DisputeRepository
             panel_rejects   TINYINT UNSIGNED NOT NULL DEFAULT 0,
             panel_size      TINYINT UNSIGNED NOT NULL DEFAULT 5,
             created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            resolved_at     DATETIME                 DEFAULT NULL,
+            resolved_at              DATETIME DEFAULT NULL,
+            resolved_notified_at     DATETIME DEFAULT NULL,
             PRIMARY KEY (id),
             INDEX idx_page   (page_id),
             INDEX idx_vote   (vote_id),
@@ -974,6 +1125,7 @@ class DisputeRepository
             note             VARCHAR(500)             DEFAULT NULL,
             assigned_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
             voted_at         DATETIME                 DEFAULT NULL,
+            notified_at      DATETIME                 DEFAULT NULL,
             PRIMARY KEY (id),
             UNIQUE KEY uq_panelist_dispute (dispute_id, panelist_user_id),
             INDEX idx_dispute   (dispute_id),
@@ -994,16 +1146,16 @@ class DisputeRepository
             status         VARCHAR(20)     NOT NULL DEFAULT 'open',
             created_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
             reviewed_at    DATETIME                 DEFAULT NULL,
+            notified_at    DATETIME                 DEFAULT NULL,
             PRIMARY KEY (id),
             INDEX idx_reported (reported_id),
             INDEX idx_reporter (reporter_id),
-            INDEX idx_status   (status)
+            INDEX idx_status   (status),
+            UNIQUE KEY uq_reporter_reported_reason (reporter_id, reported_id, reason_key)
         ) {$charset};
         ";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         dbDelta($sql);
-
-        update_option('bcc_disputes_db_version', BCC_DISPUTES_VERSION);
     }
 }
