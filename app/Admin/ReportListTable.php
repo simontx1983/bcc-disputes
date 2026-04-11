@@ -104,7 +104,7 @@ class ReportListTable extends WP_List_Table
         $this->set_pagination_args([
             'total_items' => $total,
             'per_page'    => $per_page,
-            'total_pages' => ceil($total / $per_page),
+            'total_pages' => (int) ceil($total / $per_page),
         ]);
 
         // Query via repository — explicit columns, no SELECT *.
@@ -136,6 +136,11 @@ class ReportListTable extends WP_List_Table
         ];
     }
 
+    /**
+     * @param object $item
+     * @param string $column_name
+     * @return string|int
+     */
     public function column_default($item, $column_name)
     {
         $labels = self::reason_labels();
@@ -180,33 +185,46 @@ class ReportListTable extends WP_List_Table
                 $is_open = $item->status === 'open';
                 if (!$is_open) {
                     $label = $item->status === 'penalized'
-                        ? sprintf(__('Penalized (-%s pts)', 'bcc-disputes'), esc_html($item->penalty_amount ?? '?'))
+                        ? __('Penalized', 'bcc-disputes')
                         : ucfirst($item->status);
                     return '<em>' . esc_html($label) . '</em>';
                 }
 
-                $reviewed_url = wp_nonce_url(
-                    add_query_arg(['page' => 'bcc-reports', 'report_id' => (int) $item->id, 'report_action' => 'reviewed'], admin_url('admin.php')),
-                    'bcc_report_action_' . (int) $item->id
-                );
-                $dismissed_url = wp_nonce_url(
-                    add_query_arg(['page' => 'bcc-reports', 'report_id' => (int) $item->id, 'report_action' => 'dismissed'], admin_url('admin.php')),
-                    'bcc_report_action_' . (int) $item->id
-                );
-
                 $penalize_nonce = wp_create_nonce('bcc_report_penalize_' . (int) $item->id);
 
-                return sprintf(
-                    '<a href="%s" class="button button-small" onclick="return confirm(\'%s\');">%s</a> ',
-                    esc_url($reviewed_url),
+                // SECURITY: Use POST forms instead of GET anchor tags to prevent
+                // CSRF via nonce extraction from cached/prefetched page source.
+                $reviewed_form = sprintf(
+                    '<form method="post" action="%s" style="display:inline" onsubmit="return confirm(\'%s\');">'
+                    . '<input type="hidden" name="page" value="bcc-reports">'
+                    . '<input type="hidden" name="report_id" value="%d">'
+                    . '<input type="hidden" name="report_action" value="reviewed">'
+                    . '%s'
+                    . '<button type="submit" class="button button-small">%s</button>'
+                    . '</form> ',
+                    esc_url(admin_url('admin-post.php')),
                     esc_js(__('Mark this report as reviewed?', 'bcc-disputes')),
+                    (int) $item->id,
+                    wp_nonce_field('bcc_report_action_' . (int) $item->id, '_wpnonce', true, false),
                     esc_html__('Reviewed', 'bcc-disputes')
-                ) . sprintf(
-                    '<a href="%s" class="button button-small" onclick="return confirm(\'%s\');">%s</a>',
-                    esc_url($dismissed_url),
+                );
+
+                $dismissed_form = sprintf(
+                    '<form method="post" action="%s" style="display:inline" onsubmit="return confirm(\'%s\');">'
+                    . '<input type="hidden" name="page" value="bcc-reports">'
+                    . '<input type="hidden" name="report_id" value="%d">'
+                    . '<input type="hidden" name="report_action" value="dismissed">'
+                    . '%s'
+                    . '<button type="submit" class="button button-small">%s</button>'
+                    . '</form>',
+                    esc_url(admin_url('admin-post.php')),
                     esc_js(__('Dismiss this report?', 'bcc-disputes')),
+                    (int) $item->id,
+                    wp_nonce_field('bcc_report_action_' . (int) $item->id, '_wpnonce', true, false),
                     esc_html__('Dismiss', 'bcc-disputes')
-                ) . sprintf(
+                );
+
+                return $reviewed_form . $dismissed_form . sprintf(
                     '<form method="post" action="%s" style="display:inline-flex;align-items:center;gap:4px;margin-top:6px;" '
                     . 'onsubmit="return confirm(\'Reduce this user\\\'s reputation score?\');">'
                     . '<input type="hidden" name="page" value="bcc-reports" />'

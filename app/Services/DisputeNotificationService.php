@@ -50,6 +50,16 @@ class DisputeNotificationService
             as_enqueue_async_action($hook, $args, 'bcc-disputes');
             return;
         }
+
+        // SECURITY: If DISABLE_WP_CRON is true (common on managed hosting
+        // like WP Engine, Kinsta), wp_schedule_single_event will queue the
+        // event but it will never fire — silently dropping dispute resolution
+        // and all notification emails. Fall back to synchronous execution.
+        if (defined('DISABLE_WP_CRON') && DISABLE_WP_CRON) {
+            do_action($hook, ...$args);
+            return;
+        }
+
         wp_schedule_single_event(time(), $hook, $args);
     }
 
@@ -75,7 +85,13 @@ class DisputeNotificationService
             BCC_DISPUTES_TTL_DAYS,
             $dispute_id
         );
-        wp_mail($user->user_email, $subject, $body);
+        if (!wp_mail($user->user_email, $subject, $body)) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] wp_mail failed', [
+                'type' => 'panelist_notification',
+                'user_id' => $uid,
+                'dispute_id' => $dispute_id,
+            ]);
+        }
     }
 
     public static function emailReportedUser(int $report_id, WP_User $reported_user): void
@@ -91,17 +107,22 @@ class DisputeNotificationService
             $site_name,
             $site_name
         );
-        wp_mail($reported_user->user_email, $subject, $body);
+        if (!wp_mail($reported_user->user_email, $subject, $body)) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] wp_mail failed', [
+                'type' => 'reported_user_notification',
+                'report_id' => $report_id,
+            ]);
+        }
     }
 
     public static function emailAdminReport(int $report_id, int $reporter_id, WP_User $reported_user, string $reason_key, string $reason_detail): void
     {
         // Idempotency gate: prevent duplicate admin emails on retry/overlap.
+        // Token is set AFTER successful wp_mail to allow retry on failure.
         $lock_key = 'bcc_admin_report_sent_' . $report_id;
         if (get_transient($lock_key)) {
             return;
         }
-        set_transient($lock_key, 1, DAY_IN_SECONDS);
 
         $admin_email   = get_option('admin_email');
         $site_name     = get_bloginfo('name');
@@ -156,7 +177,16 @@ class DisputeNotificationService
             $admin_url
         );
 
-        wp_mail($admin_email, $subject, $body);
+        if (wp_mail($admin_email, $subject, $body)) {
+            // Only set the idempotency token AFTER confirmed send.
+            // If wp_mail fails, the token is NOT set, allowing retry.
+            set_transient($lock_key, 1, DAY_IN_SECONDS);
+        } else {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] wp_mail failed', [
+                'type' => 'admin_report_notification',
+                'report_id' => $report_id,
+            ]);
+        }
     }
 
     public static function emailReporterResult(int $disputeId, int $reporterId, string $outcome): void
@@ -176,6 +206,12 @@ class DisputeNotificationService
         $body = $outcome === 'accepted'
             ? 'Good news! The community panel reviewed your dispute and agreed the vote was invalid. It has been removed from your trust score.'
             : 'The community panel reviewed your dispute and decided the vote was valid. The vote remains on your profile.';
-        wp_mail($reporter->user_email, $subject, $body);
+        if (!wp_mail($reporter->user_email, $subject, $body)) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] wp_mail failed', [
+                'type' => 'reporter_result_notification',
+                'dispute_id' => $disputeId,
+                'reporter_id' => $reporterId,
+            ]);
+        }
     }
 }

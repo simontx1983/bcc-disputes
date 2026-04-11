@@ -92,22 +92,11 @@ class DisputeScheduler
         // trust-engine adjudication — blocking the cron with 50 sequential
         // transactions causes timeouts at scale.
         foreach ($expired as $dispute) {
-            $accepts    = (int) $dispute->panel_accepts;
-            $rejects    = (int) $dispute->panel_rejects;
-            $panelSize  = (int) $dispute->panel_size;
-            $majority   = (int) floor($panelSize / 2) + 1;
-            $quorum     = min(3, $panelSize);
-            $totalVoted = $accepts + $rejects;
-
-            // Auto-resolve requires quorum (3+ votes) AND a majority of
-            // the full panel size — not just majority of votes cast.
-            // If quorum is not met or no majority of panel, reject by
-            // default (protects the original voter's decision).
-            if ($totalVoted >= $quorum && $accepts >= $majority) {
-                $outcome = 'accepted';
-            } else {
-                $outcome = 'rejected';
-            }
+            $verdict = DisputeRepository::computeVerdict(
+                (int) $dispute->panel_accepts,
+                (int) $dispute->panel_rejects,
+                (int) $dispute->panel_size
+            );
 
             $args = [
                 (int) $dispute->id,
@@ -115,8 +104,9 @@ class DisputeScheduler
                 (int) $dispute->page_id,
                 (int) $dispute->voter_id,
                 (int) $dispute->reporter_id,
-                $outcome,
+                $verdict['outcome'],
             ];
+
 
             DisputeNotificationService::enqueueAsync('bcc_disputes_async_resolve', $args);
         }
@@ -221,46 +211,27 @@ class DisputeScheduler
      */
     private static function retryStuckReviewingDisputes(): void
     {
-        global $wpdb;
-        $table = DisputeRepository::disputes_table();
-
         // Grace period: only retry disputes where the last vote was > 2 minutes ago.
         $cutoff = gmdate('Y-m-d H:i:s', time() - 120);
 
-        $stuck = $wpdb->get_results($wpdb->prepare(
-            "SELECT id, vote_id, page_id, voter_id, reporter_id,
-                    panel_accepts, panel_rejects, panel_size
-             FROM {$table}
-             WHERE status = 'reviewing'
-               AND (panel_accepts + panel_rejects) >= panel_size
-               AND created_at < %s
-             LIMIT 10",
-            $cutoff
-        ));
+        $stuck = DisputeRepository::getStuckReviewingDisputes($cutoff, 10);
 
         if (empty($stuck)) {
             return;
         }
 
         foreach ($stuck as $dispute) {
-            $accepts   = (int) $dispute->panel_accepts;
-            $rejects   = (int) $dispute->panel_rejects;
-            $panelSize = (int) $dispute->panel_size;
-            $majority  = (int) floor($panelSize / 2) + 1;
-            $quorum    = min(3, $panelSize);
-            $totalVoted = $accepts + $rejects;
-
-            if ($totalVoted >= $quorum && $accepts >= $majority) {
-                $outcome = 'accepted';
-            } else {
-                $outcome = 'rejected';
-            }
+            $verdict = DisputeRepository::computeVerdict(
+                (int) $dispute->panel_accepts,
+                (int) $dispute->panel_rejects,
+                (int) $dispute->panel_size
+            );
 
             CoreLogger::info('[bcc-disputes] retry_stuck_reviewing', [
                 'dispute_id' => (int) $dispute->id,
-                'accepts'    => $accepts,
-                'rejects'    => $rejects,
-                'outcome'    => $outcome,
+                'accepts'    => (int) $dispute->panel_accepts,
+                'rejects'    => (int) $dispute->panel_rejects,
+                'outcome'    => $verdict['outcome'],
             ]);
 
             DisputeNotificationService::enqueueAsync('bcc_disputes_async_resolve', [
@@ -269,7 +240,7 @@ class DisputeScheduler
                 (int) $dispute->page_id,
                 (int) $dispute->voter_id,
                 (int) $dispute->reporter_id,
-                $outcome,
+                $verdict['outcome'],
             ]);
         }
     }

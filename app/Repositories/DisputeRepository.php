@@ -43,6 +43,31 @@ class DisputeRepository
         return DB::table('user_reports');
     }
 
+    // ── Verdict calculation (shared, single source of truth) ──────────────
+
+    /**
+     * Determine whether a dispute should resolve and what the outcome is.
+     *
+     * Rules:
+     * - Quorum: at least min(3, panel_size) votes must be cast.
+     * - Majority: accepts or rejects must reach floor(panel_size/2)+1.
+     * - If quorum is met and accepts >= majority → 'accepted'.
+     * - Otherwise → 'rejected' (protects the original voter's decision).
+     *
+     * @return array{should_resolve: bool, outcome: string}
+     */
+    public static function computeVerdict(int $accepts, int $rejects, int $panelSize): array
+    {
+        $totalVoted = $accepts + $rejects;
+        $majority   = (int) floor($panelSize / 2) + 1;
+        $quorum     = min(3, $panelSize);
+
+        $shouldResolve = $totalVoted >= $quorum && ($accepts >= $majority || $rejects >= $majority);
+        $outcome       = ($totalVoted >= $quorum && $accepts >= $majority) ? 'accepted' : 'rejected';
+
+        return ['should_resolve' => $shouldResolve, 'outcome' => $outcome];
+    }
+
     // ── Cache helpers ────────────────────────────────────────────────────────
 
     /**
@@ -642,6 +667,21 @@ class DisputeRepository
             return null;
         }
 
+        // Enforce the per-target ceiling atomically inside the transaction.
+        // The controller-level check is pre-transaction and subject to TOCTOU.
+        // This FOR UPDATE lock serialises concurrent reporters targeting the
+        // same user, preventing coordinated ceiling bypass.
+        $targetOpenCount = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE reported_id = %d AND status = 'open'
+             FOR UPDATE",
+            $reportedId
+        ));
+        if ($targetOpenCount >= 10) {
+            $wpdb->query('ROLLBACK');
+            return null;
+        }
+
         $wpdb->insert($table, [
             'reported_id'   => $reportedId,
             'reporter_id'   => $reporterId,
@@ -1163,6 +1203,29 @@ class DisputeRepository
                AND resolved_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 MINUTE)
              ORDER BY resolved_at ASC
              LIMIT %d",
+            $limit
+        ));
+    }
+
+    /**
+     * Find disputes stuck in "reviewing" where all panel votes are in
+     * but resolution was never executed (trust engine unavailable at
+     * the moment of the deciding vote).
+     */
+    public static function getStuckReviewingDisputes(string $cutoff, int $limit = 10): array
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT id, vote_id, page_id, voter_id, reporter_id,
+                    panel_accepts, panel_rejects, panel_size
+             FROM {$table}
+             WHERE status = 'reviewing'
+               AND (panel_accepts + panel_rejects) >= panel_size
+               AND created_at < %s
+             LIMIT %d",
+            $cutoff,
             $limit
         ));
     }

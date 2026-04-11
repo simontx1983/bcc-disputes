@@ -313,6 +313,7 @@ class DisputeController
         }
 
         // Atomic transaction: lock → vote → tally → re-read (all in repository).
+        /** @var array{status: string, code: string, message: string, http: int, dispute: object|null, accepts: int, rejects: int, step?: string, db_error?: string} $result */
         $result = DisputeRepository::castPanelVoteAtomic($dispute_id, $userId, $decision, $note);
 
         if ($result['status'] !== 'success') {
@@ -330,22 +331,18 @@ class DisputeController
         $accepts    = $result['accepts'];
         $rejects    = $result['rejects'];
         $dispute    = $result['dispute'];
-        $total_voted = $accepts + $rejects;
-        $panel_size  = (int) $dispute->panel_size;
-        $majority    = (int) floor($panel_size / 2) + 1;
-        // Quorum: at least 3 votes required (or panel_size if smaller).
-        $quorum      = min(3, $panel_size);
-        // Resolution requires both a clear majority of the FULL panel size
-        // AND quorum participation. This prevents 2-0 outcomes with 3 abstentions.
-        $should_resolve = $total_voted >= $quorum && ($accepts >= $majority || $rejects >= $majority);
+        $panel_size = (int) $dispute->panel_size;
+
+        // Single source of truth for verdict calculation.
+        $verdict = DisputeRepository::computeVerdict($accepts, $rejects, $panel_size);
 
         CoreLogger::audit('dispute_vote_cast', ['dispute_id' => $dispute_id, 'user_id' => $userId, 'decision' => $decision]);
 
         // Resolve outside the transaction. Multiple concurrent voters may
-        // evaluate $should_resolve = true; ResolveDisputeService is the
+        // evaluate should_resolve = true; ResolveDisputeService is the
         // authoritative idempotency gate (WHERE status = 'reviewing').
-        if ($should_resolve) {
-            $final = $accepts > $rejects ? 'accepted' : 'rejected';
+        if ($verdict['should_resolve']) {
+            $final = $verdict['outcome'];
             $this->resolve($dispute_id, (int) $dispute->vote_id, (int) $dispute->page_id, (int) $dispute->voter_id, (int) $dispute->reporter_id, $final);
         }
 

@@ -364,8 +364,15 @@ class DisputeAdmin
 
     public static function handle_report_actions(): void
     {
-        // Handle GET-based actions (reviewed, dismissed)
-        if (isset($_GET['report_action'], $_GET['page']) && $_GET['page'] === 'bcc-reports') {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        // Handle POST-based actions (reviewed, dismissed)
+        // SECURITY: These are state-mutating operations and MUST use POST
+        // to prevent CSRF via anchor tag nonce extraction.
+        if (isset($_POST['report_action']) && in_array($_POST['report_action'], ['reviewed', 'dismissed'], true)
+            && isset($_POST['page']) && $_POST['page'] === 'bcc-reports') {
             self::handle_report_status_change();
             return;
         }
@@ -383,8 +390,8 @@ class DisputeAdmin
             wp_die(__('Unauthorized.', 'bcc-disputes'));
         }
 
-        $report_id = absint($_GET['report_id'] ?? 0);
-        $action    = sanitize_key($_GET['report_action']);
+        $report_id = absint($_POST['report_id'] ?? 0);
+        $action    = sanitize_key($_POST['report_action']);
 
         if (!$report_id || !in_array($action, ['reviewed', 'dismissed'], true)) {
             return;
@@ -439,9 +446,12 @@ class DisputeAdmin
 
         // Status claimed — now safe to apply penalty (only runs once).
         $report = DisputeRepository::getReportById($report_id);
+        if (!$report) {
+            wp_die(__('Report data could not be loaded.', 'bcc-disputes'));
+        }
         $reported_user_id = (int) $report->reported_id;
 
-        if (\BCC\Core\ServiceLocator::hasRealService(\BCC\Core\Contracts\TrustReadServiceInterface::class)) {
+        if (class_exists('\\BCC\\Trust\\Plugin') && \BCC\Core\ServiceLocator::hasRealService(\BCC\Core\Contracts\TrustReadServiceInterface::class)) {
             $reputationRepo = \BCC\Trust\Plugin::instance()->reputationRepository();
             $reputationRepo->adjustScore($reported_user_id, -1 * abs($penalty_points), 'admin_report_penalty');
         }
