@@ -91,6 +91,13 @@ class DisputeController
                 'decision' => ['required' => true, 'type' => 'string', 'enum' => ['accepted', 'rejected']],
             ],
         ]);
+
+        // Operational health endpoint (admin only).
+        register_rest_route(self::NS, '/disputes/health', [
+            'methods'             => WP_REST_Server::READABLE,
+            'callback'            => [$this, 'health'],
+            'permission_callback' => function () { return current_user_can('manage_options'); },
+        ]);
     }
 
     // ── Submit dispute ────────────────────────────────────────────────────────
@@ -420,6 +427,8 @@ class DisputeController
     /**
      * Pick up to BCC_DISPUTES_PANEL_SIZE Gold/Platinum users,
      * excluding the reporter and the voter.
+     *
+     * @return int[]
      */
     private function selectPanelists(int $reporter_id, int $voter_id): array
     {
@@ -439,6 +448,9 @@ class DisputeController
         return $service->getEligiblePanelistUserIds([$reporter_id, $voter_id], $needed);
     }
 
+    /**
+     * @return array<string, mixed>
+     */
     private function formatDispute(object $d): array
     {
         $data = [
@@ -561,6 +573,71 @@ class DisputeController
             );
         }
         return null;
+    }
+
+    // ── Health endpoint ────────────────────────────────────────────────────────
+
+    /**
+     * GET /bcc/v1/disputes/health — operational health snapshot (admin only).
+     *
+     * Reports cron last-run times, queue depths, and service availability
+     * so admins can detect stale crons, backlogged queues, or missing
+     * trust-engine bindings without SSH access.
+     */
+    public function health(WP_REST_Request $req): WP_REST_Response
+    {
+        $now = time();
+
+        // Last auto-resolve run (tracked by DisputeScheduler).
+        $lastAutoResolve = (int) get_option('bcc_disputes_auto_resolve_last_run', 0);
+
+        // Count disputes in each status for queue depth.
+        $statusCounts = DisputeRepository::getDisputeStatusCounts();
+
+        // Orphaned disputes (committed but adjudication pending/failed).
+        $orphanCount = DisputeRepository::countOrphanedDisputes();
+
+        // Trust-engine availability.
+        $hasTrustRead = ServiceLocator::hasRealService(TrustReadServiceInterface::class);
+        $hasAdjudicator = ServiceLocator::hasRealService(\BCC\Core\Contracts\DisputeAdjudicationInterface::class);
+
+        // Action Scheduler backlog (if available).
+        // Use bounded per_page to avoid loading thousands of rows just to count.
+        $asBacklog = null;
+        if (function_exists('as_get_scheduled_actions')) {
+            $maxCheck = 501;
+            $pending = as_get_scheduled_actions([
+                'group'    => 'bcc-disputes',
+                'status'   => \ActionScheduler_Store::STATUS_PENDING,
+                'per_page' => $maxCheck,
+            ], 'ARRAY_A');
+            $count = is_array($pending) ? count($pending) : 0;
+            $asBacklog = $count >= $maxCheck ? '500+' : $count;
+        }
+
+        // WP-Cron status.
+        $cronDisabled = defined('DISABLE_WP_CRON') && DISABLE_WP_CRON;
+        $nextAutoResolve = wp_next_scheduled('bcc_disputes_auto_resolve');
+
+        return rest_ensure_response([
+            'status'    => 'ok',
+            'timestamp' => gmdate('c'),
+            'cron'      => [
+                'wp_cron_disabled'         => $cronDisabled,
+                'auto_resolve_last_run'    => $lastAutoResolve > 0 ? gmdate('c', $lastAutoResolve) : null,
+                'auto_resolve_age_seconds' => $lastAutoResolve > 0 ? $now - $lastAutoResolve : null,
+                'next_auto_resolve'        => $nextAutoResolve ? gmdate('c', $nextAutoResolve) : null,
+                'action_scheduler_backlog' => $asBacklog,
+            ],
+            'queues'    => [
+                'status_counts' => $statusCounts,
+                'orphaned'      => $orphanCount,
+            ],
+            'services'  => [
+                'trust_read_service'    => $hasTrustRead,
+                'dispute_adjudicator'   => $hasAdjudicator,
+            ],
+        ]);
     }
 
     private function error(string $code, string $message, int $status): WP_REST_Response

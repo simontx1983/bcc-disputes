@@ -43,6 +43,8 @@ class DisputeNotificationService
     /**
      * Enqueue an async action. Uses Action Scheduler when available;
      * falls back to wp_schedule_single_event (wp-cron).
+     *
+     * @param array<int, mixed> $args
      */
     public static function enqueueAsync(string $hook, array $args): void
     {
@@ -51,15 +53,15 @@ class DisputeNotificationService
             return;
         }
 
-        // SECURITY: If DISABLE_WP_CRON is true (common on managed hosting
-        // like WP Engine, Kinsta), wp_schedule_single_event will queue the
-        // event but it will never fire — silently dropping dispute resolution
-        // and all notification emails. Fall back to synchronous execution.
-        if (defined('DISABLE_WP_CRON') && DISABLE_WP_CRON) {
-            do_action($hook, ...$args);
-            return;
-        }
-
+        // Even with DISABLE_WP_CRON, wp_schedule_single_event queues the
+        // event in the database. It will fire on the next HTTP request that
+        // invokes wp-cron.php (which managed hosts trigger via system cron).
+        // The old synchronous fallback risked 50 sequential resolutions
+        // timing out the cron process.
+        //
+        // On hosts where system cron fires wp-cron.php (WP Engine, Kinsta),
+        // this works. If neither WP-Cron nor system cron is available, the
+        // admin notice in DisputeScheduler::warnIfCronDisabled() alerts.
         wp_schedule_single_event(time(), $hook, $args);
     }
 

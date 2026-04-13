@@ -38,6 +38,9 @@ class DisputeScheduler
         add_action(self::EVENT_RECONCILE, [__CLASS__, 'reconcileOrphanedDisputes']);
         add_action('bcc_disputes_async_resolve', [__CLASS__, 'handleAsyncResolve'], 10, 6);
 
+        // Admin health check: warn if WP-Cron is disabled without a system cron.
+        add_action('admin_notices', [__CLASS__, 'warnIfCronDisabled']);
+
         // Register the 5-minute cron interval if not already available.
         add_filter('cron_schedules', function (array $schedules): array {
             if (!isset($schedules['bcc_five_minutes'])) {
@@ -52,6 +55,13 @@ class DisputeScheduler
 
     /**
      * Async handler: resolve a single dispute outside the cron loop.
+     *
+     * @param int|string $dispute_id
+     * @param int|string $vote_id
+     * @param int|string $page_id
+     * @param int|string $voter_id
+     * @param int|string $reporter_id
+     * @param string     $outcome
      */
     public static function handleAsyncResolve($dispute_id, $vote_id, $page_id, $voter_id, $reporter_id, $outcome): void
     {
@@ -73,6 +83,7 @@ class DisputeScheduler
 
         try {
             self::doAutoResolve();
+            update_option('bcc_disputes_auto_resolve_last_run', time(), false);
         } finally {
             DisputeRepository::releaseAutoResolveLock();
         }
@@ -128,14 +139,14 @@ class DisputeScheduler
      */
     public static function reconcileOrphanedDisputes(): void
     {
-        if (!DisputeRepository::acquireAutoResolveLock()) {
+        if (!DisputeRepository::acquireReconcileLock()) {
             return; // Another process is running — skip this tick.
         }
 
         try {
             self::doReconcile();
         } finally {
-            DisputeRepository::releaseAutoResolveLock();
+            DisputeRepository::releaseReconcileLock();
         }
     }
 
@@ -165,14 +176,22 @@ class DisputeScheduler
                 'reopen_count' => $dispute->reopen_count,
             ]);
 
-            $success = $resolver->executeAdjudication(
-                $disputeId,
-                (int) $dispute->vote_id,
-                (int) $dispute->page_id,
-                (int) $dispute->voter_id,
-                $dispute->status,
-                0 // system actor
-            );
+            try {
+                $success = $resolver->executeAdjudication(
+                    $disputeId,
+                    (int) $dispute->vote_id,
+                    (int) $dispute->page_id,
+                    (int) $dispute->voter_id,
+                    $dispute->status,
+                    0 // system actor
+                );
+            } catch (\Throwable $e) {
+                CoreLogger::error('[bcc-disputes] reconcile_exception', [
+                    'dispute_id' => $disputeId,
+                    'error'      => $e->getMessage(),
+                ]);
+                $success = false;
+            }
 
             if ($success) {
                 DisputeRepository::setAdjudicationStatus($disputeId, 'completed');
@@ -243,6 +262,34 @@ class DisputeScheduler
                 $verdict['outcome'],
             ]);
         }
+    }
+
+    /**
+     * Show an admin notice if WP-Cron is disabled and the auto-resolve
+     * cron hasn't fired recently. Without a system cron replacement,
+     * disputes will never auto-resolve and reconciliation won't run.
+     */
+    public static function warnIfCronDisabled(): void
+    {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        if (!defined('DISABLE_WP_CRON') || !DISABLE_WP_CRON) {
+            return;
+        }
+
+        // Check if auto-resolve has fired within the last 48 hours.
+        $lastRun = (int) get_option('bcc_disputes_auto_resolve_last_run', 0);
+        if ($lastRun > 0 && (time() - $lastRun) < 2 * DAY_IN_SECONDS) {
+            return; // System cron is working — no warning needed.
+        }
+
+        echo '<div class="notice notice-warning"><p>';
+        echo '<strong>BCC Disputes:</strong> ';
+        echo 'DISABLE_WP_CRON is enabled but the dispute auto-resolve cron has not fired in over 48 hours. ';
+        echo 'Please configure a system cron (<code>wp-cron.php</code>) to ensure disputes are auto-resolved and reconciliation runs.';
+        echo '</p></div>';
     }
 
 }

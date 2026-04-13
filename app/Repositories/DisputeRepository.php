@@ -19,11 +19,7 @@ class DisputeRepository
     /** TTL for data that changes less often (individual dispute lookups). */
     private const TTL_WARM = 300;
 
-    /** Dispute table columns. */
-    private const DISPUTE_COLUMNS = 'id, vote_id, page_id, reporter_id, voter_id, reason, evidence_url, status, panel_accepts, panel_rejects, panel_size, created_at, resolved_at';
-
-    /** Panel table columns. */
-    private const PANEL_COLUMNS = 'id, dispute_id, panelist_user_id, decision, note, assigned_at, voted_at, notified_at';
+    // DISPUTE_COLUMNS and PANEL_COLUMNS removed — were defined but never referenced.
 
     /** User reports table columns. */
     private const REPORT_COLUMNS = 'id, reported_id, reporter_id, reason_key, reason_detail, status, created_at, reviewed_at';
@@ -135,6 +131,25 @@ class DisputeRepository
         $wpdb->query("SELECT RELEASE_LOCK('bcc_disputes_auto_resolve')");
     }
 
+    /**
+     * Acquire the reconciliation advisory lock (separate from auto-resolve
+     * so the two cron events do not block each other).
+     */
+    public static function acquireReconcileLock(): bool
+    {
+        global $wpdb;
+        return (int) $wpdb->get_var("SELECT GET_LOCK('bcc_disputes_reconcile', 0)") === 1;
+    }
+
+    /**
+     * Release the reconciliation advisory lock.
+     */
+    public static function releaseReconcileLock(): void
+    {
+        global $wpdb;
+        $wpdb->query("SELECT RELEASE_LOCK('bcc_disputes_reconcile')");
+    }
+
     // ── Query methods ────────────────────────────────────────────────────────
 
     /**
@@ -156,7 +171,7 @@ class DisputeRepository
     /**
      * Atomically create a dispute row and its panel assignments.
      *
-     * @param array  $disputeData  Dispute column values.
+     * @param array<string, mixed> $disputeData  Dispute column values.
      * @param int[]  $panelistIds  User IDs to assign as panelists.
      * @return array{id: ?int, failed_panelist: ?int, db_error: ?string}
      */
@@ -178,12 +193,12 @@ class DisputeRepository
              FOR UPDATE",
             $pageId
         ));
-        if ($recentCount >= 3) {
+        if ($recentCount >= BCC_DISPUTES_MAX_PER_PAGE) {
             $wpdb->query('ROLLBACK');
             return ['id' => null, 'failed_panelist' => null, 'db_error' => 'dispute_limit_reached'];
         }
 
-        // Per-reporter global limit: max 5 active disputes at any time.
+        // Per-reporter global limit: max active disputes at any time.
         // Prevents panelist pool exhaustion by users with many pages.
         $reporterId = (int) $disputeData['reporter_id'];
         $activeReporterCount = (int) $wpdb->get_var($wpdb->prepare(
@@ -192,7 +207,7 @@ class DisputeRepository
              FOR UPDATE",
             $reporterId
         ));
-        if ($activeReporterCount >= 5) {
+        if ($activeReporterCount >= BCC_DISPUTES_REPORTER_MAX_ACTIVE) {
             $wpdb->query('ROLLBACK');
             return ['id' => null, 'failed_panelist' => null, 'db_error' => 'reporter_limit_reached'];
         }
@@ -284,28 +299,47 @@ class DisputeRepository
             return [];
         }
 
-        $sorted = $voteIds;
-        sort($sorted);
-        $cacheKey = 'disputed_votes:' . md5(json_encode($sorted));
-        $cached   = wp_cache_get($cacheKey, self::CACHE_GROUP);
-        if ($cached !== false) {
-            return $cached;
+        // Cache per individual vote ID rather than per-set to avoid
+        // unbounded unique cache keys from different combinations.
+        $result = [];
+        $uncached = [];
+        foreach ($voteIds as $vid) {
+            $cached = wp_cache_get("disputed_vote:{$vid}", self::CACHE_GROUP);
+            if ($cached !== false) {
+                if ($cached === 1) {
+                    $result[$vid] = true;
+                }
+            } else {
+                $uncached[] = $vid;
+            }
+        }
+        if (empty($uncached)) {
+            return $result;
         }
 
         global $wpdb;
         $table = self::disputes_table();
 
-        $placeholders = implode(',', array_fill(0, count($voteIds), '%d'));
+        $placeholders = implode(',', array_fill(0, count($uncached), '%d'));
         $rows = $wpdb->get_col($wpdb->prepare(
             "SELECT DISTINCT vote_id
              FROM {$table}
              WHERE vote_id IN ({$placeholders})
                AND status IN ('reviewing','accepted')",
-            ...$voteIds
+            ...$uncached
         ));
 
-        $result = array_fill_keys(array_map('intval', $rows), true);
-        wp_cache_set($cacheKey, $result, self::CACHE_GROUP, self::TTL_HOT);
+        $disputed = array_fill_keys(array_map('intval', $rows), true);
+
+        // Cache each vote ID individually (disputed=1, not disputed=0).
+        foreach ($uncached as $vid) {
+            $isDisputed = isset($disputed[$vid]);
+            wp_cache_set("disputed_vote:{$vid}", $isDisputed ? 1 : 0, self::CACHE_GROUP, self::TTL_HOT);
+            if ($isDisputed) {
+                $result[$vid] = true;
+            }
+        }
+
         return $result;
     }
 
@@ -952,19 +986,8 @@ class DisputeRepository
         ));
     }
 
-    /**
-     * Check whether a report exists.
-     */
-    public static function reportExists(int $reportId): bool
-    {
-        global $wpdb;
-        $table = self::user_reports_table();
-
-        return (bool) $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$table} WHERE id = %d LIMIT 1",
-            $reportId
-        ));
-    }
+    // reportExists() removed — TOCTOU-redundant. updateReportStatus()
+    // handles non-existent and already-resolved reports atomically.
 
     public static function getReportById(int $reportId): ?object
     {
@@ -977,11 +1000,6 @@ class DisputeRepository
         ));
     }
 
-    /**
-     * Update a report's status and reviewed_at timestamp.
-     *
-     * @return bool True on success, false on DB error.
-     */
     /**
      * Transition a report from 'open' to the given status.
      *
@@ -1127,41 +1145,8 @@ class DisputeRepository
         $wpdb->query('ROLLBACK');
     }
 
-    /**
-     * Re-open a resolved dispute (on adjudication failure).
-     *
-     * Only acts on disputes currently in a resolved state ('accepted'/'rejected')
-     * to prevent blindly overwriting a concurrent admin re-resolution.
-     * Uses a raw query to set resolved_at to SQL NULL (wpdb::update with %s
-     * casts PHP null to empty string, not SQL NULL).
-     */
-    public static function reopenDispute(int $disputeId): bool
-    {
-        global $wpdb;
-        $table = self::disputes_table();
-
-        // Circuit breaker: max 2 reopens. After that, leave it resolved
-        // and log for manual admin review rather than looping forever.
-        $reopenCount = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT reopen_count FROM {$table} WHERE id = %d",
-            $disputeId
-        ));
-        if ($reopenCount >= 2) {
-            \BCC\Core\Log\Logger::error('[bcc-disputes] reopen_circuit_breaker', [
-                'dispute_id'   => $disputeId,
-                'reopen_count' => $reopenCount,
-            ]);
-            return false;
-        }
-
-        $result = $wpdb->query($wpdb->prepare(
-            "UPDATE {$table} SET status = 'reviewing', resolved_at = NULL, reopen_count = reopen_count + 1
-             WHERE id = %d AND status IN ('accepted','rejected')",
-            $disputeId
-        ));
-
-        return $result !== false && $result > 0;
-    }
+    // reopenDispute() removed — dead code. Reconciliation uses
+    // setAdjudicationStatus() + incrementReopenCount() directly.
 
     // ── Adjudication status tracking ──────────────────────────────────────
 
@@ -1187,7 +1172,7 @@ class DisputeRepository
      * These are split-brain orphans that need reconciliation.
      *
      * @param int $limit Max disputes to return per batch.
-     * @return array
+     * @return list<object>
      */
     public static function getOrphanedDisputes(int $limit = 10): array
     {
@@ -1211,23 +1196,55 @@ class DisputeRepository
      * Find disputes stuck in "reviewing" where all panel votes are in
      * but resolution was never executed (trust engine unavailable at
      * the moment of the deciding vote).
+     *
+     * @return list<object>
      */
     public static function getStuckReviewingDisputes(string $cutoff, int $limit = 10): array
     {
         global $wpdb;
         $table = self::disputes_table();
 
+        $panelTable = self::panel_table();
+
+        // Use the latest panel vote timestamp (not dispute created_at)
+        // to avoid re-triggering resolution on old disputes where the
+        // deciding vote just came in seconds ago.
         return $wpdb->get_results($wpdb->prepare(
-            "SELECT id, vote_id, page_id, voter_id, reporter_id,
-                    panel_accepts, panel_rejects, panel_size
-             FROM {$table}
-             WHERE status = 'reviewing'
-               AND (panel_accepts + panel_rejects) >= panel_size
-               AND created_at < %s
+            "SELECT d.id, d.vote_id, d.page_id, d.voter_id, d.reporter_id,
+                    d.panel_accepts, d.panel_rejects, d.panel_size
+             FROM {$table} d
+             INNER JOIN (
+                 SELECT dispute_id, MAX(voted_at) AS last_voted_at
+                 FROM {$panelTable}
+                 WHERE decision IS NOT NULL
+                 GROUP BY dispute_id
+             ) pv ON pv.dispute_id = d.id
+             WHERE d.status = 'reviewing'
+               AND (d.panel_accepts + d.panel_rejects) >= d.panel_size
+               AND pv.last_voted_at < %s
+             ORDER BY pv.last_voted_at ASC
              LIMIT %d",
             $cutoff,
             $limit
         ));
+    }
+
+    /**
+     * Count orphaned disputes (committed but adjudication pending/failed).
+     * Uses COUNT(*) instead of hydrating full rows.
+     */
+    public static function countOrphanedDisputes(): int
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        return (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE status IN ('accepted', 'rejected')
+               AND adjudication_status IN ('pending', 'failed')
+               AND reopen_count < 3
+               AND resolved_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 MINUTE)"
+        );
     }
 
     // ── Cache invalidation ─────────────────────────────────────────────────

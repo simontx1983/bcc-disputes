@@ -24,6 +24,9 @@ class ReportListTable extends WP_List_Table
         ]);
     }
 
+    /**
+     * @return array<string, string>
+     */
     public function get_columns(): array
     {
         return [
@@ -38,6 +41,9 @@ class ReportListTable extends WP_List_Table
         ];
     }
 
+    /**
+     * @return array<string, array{0: string, 1: bool}>
+     */
     public function get_sortable_columns(): array
     {
         return [
@@ -47,6 +53,9 @@ class ReportListTable extends WP_List_Table
         ];
     }
 
+    /**
+     * @return array<string, string>
+     */
     protected function get_views(): array
     {
         $current = isset($_GET['report_status']) ? sanitize_key($_GET['report_status']) : 'all';
@@ -123,6 +132,9 @@ class ReportListTable extends WP_List_Table
         ];
     }
 
+    /**
+     * @return array<string, string>
+     */
     private static function reason_labels(): array
     {
         return [
@@ -202,7 +214,7 @@ class ReportListTable extends WP_List_Table
                     . '%s'
                     . '<button type="submit" class="button button-small">%s</button>'
                     . '</form> ',
-                    esc_url(admin_url('admin-post.php')),
+                    esc_url(admin_url('admin.php')),
                     esc_js(__('Mark this report as reviewed?', 'bcc-disputes')),
                     (int) $item->id,
                     wp_nonce_field('bcc_report_action_' . (int) $item->id, '_wpnonce', true, false),
@@ -217,7 +229,7 @@ class ReportListTable extends WP_List_Table
                     . '%s'
                     . '<button type="submit" class="button button-small">%s</button>'
                     . '</form>',
-                    esc_url(admin_url('admin-post.php')),
+                    esc_url(admin_url('admin.php')),
                     esc_js(__('Dismiss this report?', 'bcc-disputes')),
                     (int) $item->id,
                     wp_nonce_field('bcc_report_action_' . (int) $item->id, '_wpnonce', true, false),
@@ -238,7 +250,7 @@ class ReportListTable extends WP_List_Table
                     .   'style="width:120px;height:28px;padding:2px 4px;font-size:12px;" />'
                     . '<button type="submit" class="button button-small" style="color:#d63638;">Apply</button>'
                     . '</form>',
-                    esc_url(admin_url('admin-post.php')),
+                    esc_url(admin_url('admin.php')),
                     (int) $item->id,
                     esc_attr($penalize_nonce)
                 );

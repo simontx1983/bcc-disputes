@@ -38,7 +38,7 @@ Namespace root: `BCC\Disputes\` mapped to `app/` via Composer PSR-4. Follow the 
 ### Key Classes
 
 - **`DisputeController`** — REST API handler. Registers 7 routes under `bcc/v1`. Orchestrates dispute submission (validates vote, selects panelists, creates DB rows, emails panelists), panel voting, and user reporting. Uses throttling with trust-engine fallback.
-- **`ResolveDisputeService`** — Core resolution logic. Wraps dispute status update + trust-engine adjudication call (`DisputeAdjudicationInterface`) in a DB transaction. Implements pre-commit gate: if the adjudicator is unavailable, rolls back rather than leaving a half-resolved dispute. Fires `bcc_dispute_accepted` / `bcc_dispute_rejected` hooks.
+- **`ResolveDisputeService`** — Core resolution logic. Wraps dispute status update + trust-engine adjudication call (`DisputeAdjudicationInterface`) in a DB transaction. Implements pre-commit gate: if the adjudicator is unavailable, rolls back rather than leaving a half-resolved dispute. Fires `bcc.trust.dispute_rejected_penalty` hook on rejected disputes.
 - **`DisputeScheduler`** — Daily cron (`bcc_disputes_auto_resolve`). Auto-resolves disputes older than `BCC_DISPUTES_TTL_DAYS` (7). Majority wins; ties favor the voter (rejected).
 - **`DisputeRepository`** — Schema installation only (3 tables via `dbDelta`). Table names resolved via `BCC\Core\DB\DB::table()`.
 - **`DisputeAdmin`** — Admin UI under `bcc-trust-dashboard` menu. Detail view with panel vote tally, force-resolve actions.
@@ -67,8 +67,10 @@ Three tables prefixed via `BCC\Core\DB\DB::table()`:
 BCC_DISPUTES_VERSION     // '1.1.0'
 BCC_DISPUTES_PATH        // plugin_dir_path
 BCC_DISPUTES_URL         // plugin_dir_url
-BCC_DISPUTES_PANEL_SIZE  // 5 — panelists per dispute
-BCC_DISPUTES_TTL_DAYS    // 7 — auto-resolve deadline
+BCC_DISPUTES_PANEL_SIZE          // 5 — panelists per dispute
+BCC_DISPUTES_TTL_DAYS            // 7 — auto-resolve deadline
+BCC_DISPUTES_MAX_PER_PAGE        // 3 — max disputes per page per 30 days
+BCC_DISPUTES_REPORTER_MAX_ACTIVE // 5 — max active disputes per reporter
 ```
 
 ### REST API
@@ -98,6 +100,7 @@ All routes require authentication. Namespace: `bcc/v1`.
 - All DB table names via `BCC\Core\DB\DB::table()`, never hardcoded prefixes
 - Bridge files in `includes/` are backward-compat only — never add new logic there
 - Boot order in main file: constants → autoloader → bridges → schema → hooks
+- **Naming**: `$pageId` = PeepSo page (peepso-page CPT). `$projectId` = onchain project (shadow CPT). Both are WP post IDs but refer to different post types.
 
 ## Architecture Guardrails (ENFORCED)
 

@@ -310,6 +310,9 @@ class DisputeAdmin
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    /**
+     * @param string|int|float|null $value
+     */
     private static function detail_row(string $label, $value): void
     {
         printf(
@@ -399,18 +402,16 @@ class DisputeAdmin
 
         check_admin_referer('bcc_report_action_' . $report_id);
 
-        if (!DisputeRepository::reportExists($report_id)) {
-            return;
-        }
-
+        // updateReportStatus uses WHERE status = 'open', so it handles
+        // non-existent and already-resolved reports in one atomic check.
         $update_ok = DisputeRepository::updateReportStatus($report_id, $action);
 
         if (!$update_ok) {
-            \BCC\Core\Log\Logger::error('[Disputes] report_action_failed', [
-                'report_id' => $report_id,
-                'action'    => $action,
-            ]);
-            wp_die(__('Failed to update report.', 'bcc-disputes'));
+            wp_safe_redirect(add_query_arg(
+                ['page' => 'bcc-reports', 'error' => 'already_resolved'],
+                admin_url('admin.php')
+            ));
+            exit;
         }
 
         wp_safe_redirect(add_query_arg(
@@ -451,10 +452,9 @@ class DisputeAdmin
         }
         $reported_user_id = (int) $report->reported_id;
 
-        if (class_exists('\\BCC\\Trust\\Plugin') && \BCC\Core\ServiceLocator::hasRealService(\BCC\Core\Contracts\TrustReadServiceInterface::class)) {
-            $reputationRepo = \BCC\Trust\Plugin::instance()->reputationRepository();
-            $reputationRepo->adjustScore($reported_user_id, -1 * abs($penalty_points), 'admin_report_penalty');
-        }
+        // Fire a hook so the trust-engine can apply the penalty through its
+        // own service layer, rather than reaching into its internal repository.
+        do_action('bcc.trust.admin_report_penalty', $reported_user_id, abs($penalty_points), $penalty_reason);
 
         \BCC\Core\Log\Logger::audit('[Disputes] admin_report_penalty', [
             'report_id'  => $report_id,

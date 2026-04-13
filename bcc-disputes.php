@@ -17,8 +17,10 @@ if (!defined('ABSPATH')) {
 define('BCC_DISPUTES_VERSION', '1.1.0');
 define('BCC_DISPUTES_PATH', plugin_dir_path(__FILE__));
 define('BCC_DISPUTES_URL', plugin_dir_url(__FILE__));
-define('BCC_DISPUTES_PANEL_SIZE', 5);     // panelists per dispute
-define('BCC_DISPUTES_TTL_DAYS', 7);       // auto-resolve after N days
+define('BCC_DISPUTES_PANEL_SIZE', 5);              // panelists per dispute
+define('BCC_DISPUTES_TTL_DAYS', 7);                // auto-resolve after N days
+define('BCC_DISPUTES_MAX_PER_PAGE', 3);            // max disputes per page per 30 days
+define('BCC_DISPUTES_REPORTER_MAX_ACTIVE', 5);     // max active disputes per reporter
 
 // ── Dependency check — bcc-core must be active ──────────────────────────────
 if ( ! defined( 'BCC_CORE_VERSION' ) ) {
