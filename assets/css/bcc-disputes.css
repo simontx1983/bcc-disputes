@@ -143,8 +143,9 @@
     margin-top: 8px;
     min-height: 1em;
 }
-.bcc-dispute-status--ok  { color: var(--clr-success); }
-.bcc-dispute-status--err { color: var(--clr-danger);  }
+.bcc-dispute-status--ok   { color: var(--clr-success); }
+.bcc-dispute-status--err  { color: var(--clr-danger);  }
+.bcc-dispute-status--info { color: var(--clr-warning); font-style: italic; }
 
 /* ── History (owner) ── */
 .bcc-dispute-history {

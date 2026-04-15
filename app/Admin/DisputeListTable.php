@@ -24,6 +24,9 @@ class DisputeListTable extends WP_List_Table
         ]);
     }
 
+    /**
+     * @return array<string, string>
+     */
     public function get_columns(): array
     {
         return [
@@ -39,6 +42,9 @@ class DisputeListTable extends WP_List_Table
         ];
     }
 
+    /**
+     * @return array<string, array{0: string, 1: bool}>
+     */
     public function get_sortable_columns(): array
     {
         return [
@@ -48,6 +54,9 @@ class DisputeListTable extends WP_List_Table
         ];
     }
 
+    /**
+     * @return array<string, string>
+     */
     protected function get_views(): array
     {
         $current = isset($_GET['dispute_status']) ? sanitize_key($_GET['dispute_status']) : 'all';
@@ -105,7 +114,7 @@ class DisputeListTable extends WP_List_Table
         $this->set_pagination_args([
             'total_items' => $total,
             'per_page'    => $per_page,
-            'total_pages' => ceil($total / $per_page),
+            'total_pages' => (int) ceil($total / $per_page),
         ]);
 
         // Query via repository — explicit columns, no SELECT *.
@@ -118,9 +127,11 @@ class DisputeListTable extends WP_List_Table
         );
 
         // Batch-enrich with vote data from trust-engine via interface.
+        /** @var object[] $items */
+        $items = $this->items;
         $vote_ids = array_filter(array_map(
             static fn($item): int => (int) $item->vote_id,
-            $this->items
+            $items
         ));
 
         // NullTrustReadService::getVotesByIds() returns [] — admin sees empty vote_type column.
@@ -130,7 +141,7 @@ class DisputeListTable extends WP_List_Table
         }
 
         // Merge vote_type onto each dispute row for column rendering.
-        foreach ($this->items as $item) {
+        foreach ($items as $item) {
             $vid = (int) $item->vote_id;
             $item->vote_type = isset($votes_by_id[$vid]) ? $votes_by_id[$vid]['vote_type'] : null;
         }
@@ -142,6 +153,11 @@ class DisputeListTable extends WP_List_Table
         ];
     }
 
+    /**
+     * @param object $item
+     * @param string $column_name
+     * @return string|int
+     */
     public function column_default($item, $column_name)
     {
         switch ($column_name) {

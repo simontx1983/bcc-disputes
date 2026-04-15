@@ -36,3 +36,23 @@ foreach ($tables as $table) {
 
 // Clean up cron hooks.
 wp_clear_scheduled_hook('bcc_disputes_auto_resolve');
+wp_clear_scheduled_hook('bcc_disputes_reconcile_orphans');
+
+// Clean up options.
+delete_option('bcc_disputes_auto_resolve_last_run');
+
+// Clean up transients created by DisputeNotificationService (idempotency locks).
+// Pattern: bcc_admin_report_sent_{report_id}
+$wpdb->query(
+    "DELETE FROM {$wpdb->options}
+     WHERE option_name LIKE '_transient_bcc_admin_report_sent_%'
+        OR option_name LIKE '_transient_timeout_bcc_admin_report_sent_%'"
+);
+
+// Clean up throttle transients created by DisputeController.
+// Pattern: bcc_throttle_{action}_{user_id}
+$wpdb->query(
+    "DELETE FROM {$wpdb->options}
+     WHERE option_name LIKE '_transient_bcc_throttle_%'
+        OR option_name LIKE '_transient_timeout_bcc_throttle_%'"
+);

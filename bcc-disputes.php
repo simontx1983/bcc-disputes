@@ -21,6 +21,9 @@ define('BCC_DISPUTES_PANEL_SIZE', 5);              // panelists per dispute
 define('BCC_DISPUTES_TTL_DAYS', 7);                // auto-resolve after N days
 define('BCC_DISPUTES_MAX_PER_PAGE', 3);            // max disputes per page per 30 days
 define('BCC_DISPUTES_REPORTER_MAX_ACTIVE', 5);     // max active disputes per reporter
+define('BCC_DISPUTES_MIN_REASON_LENGTH', 20);      // min chars for dispute reason
+define('BCC_DISPUTES_MAX_REASON_LENGTH', 1000);    // max chars for dispute reason
+define('BCC_DISPUTES_MIN_DETAIL_LENGTH', 10);      // min chars for report detail (reason_key=other)
 
 // ── Dependency check — bcc-core must be active ──────────────────────────────
 if ( ! defined( 'BCC_CORE_VERSION' ) ) {
@@ -47,6 +50,58 @@ if ( ! file_exists( $bcc_disputes_autoloader ) ) {
 require_once $bcc_disputes_autoloader;
 
 require_once BCC_DISPUTES_PATH . 'includes/blocks.php';
+
+// ── Admin notice: warn when panelist pool is critically low ──────────────────
+add_action('admin_notices', function (): void {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+
+    $cache_key   = 'bcc_disputes_panelist_pool_count';
+    $cache_group = 'bcc_disputes';
+    $pool_count  = wp_cache_get($cache_key, $cache_group);
+
+    if ($pool_count === false) {
+        if (!class_exists('\\BCC\\Core\\ServiceLocator')
+            || !\BCC\Core\ServiceLocator::hasRealService(\BCC\Core\Contracts\TrustReadServiceInterface::class)
+        ) {
+            return; // trust service unavailable — skip check silently
+        }
+
+        $trust_read = \BCC\Core\ServiceLocator::resolveTrustReadService();
+
+        // Pass empty exclusion list and a high limit to get the full pool
+        $eligible    = $trust_read->getEligiblePanelistUserIds([], BCC_DISPUTES_PANEL_SIZE * 3);
+        $pool_count  = is_array($eligible) ? count($eligible) : 0;
+        wp_cache_set($cache_key, $pool_count, $cache_group, HOUR_IN_SECONDS);
+    }
+
+    $minimum_healthy = BCC_DISPUTES_PANEL_SIZE * 2;
+    if ((int) $pool_count >= $minimum_healthy) {
+        return;
+    }
+
+    $level = (int) $pool_count < BCC_DISPUTES_PANEL_SIZE ? 'error' : 'warning';
+    printf(
+        '<div class="notice notice-%s"><p><strong>BCC Disputes:</strong> '
+        . 'The eligible panelist pool is critically low — only <strong>%d</strong> qualified members found. '
+        . 'At least <strong>%d</strong> are needed per dispute (and %d recommended for proper randomization). '
+        . 'Disputes cannot be filed until enough Trusted/Elite tier members with clean records are available.</p></div>',
+        esc_attr($level),
+        (int) $pool_count,
+        BCC_DISPUTES_PANEL_SIZE,
+        $minimum_healthy
+    );
+});
+
+// ── Schema migration: re-run dbDelta when plugin version changes ──────
+add_action('plugins_loaded', function (): void {
+    $stored = get_option('bcc_disputes_schema_version', '');
+    if ($stored !== BCC_DISPUTES_VERSION) {
+        \BCC\Disputes\Repositories\DisputeRepository::install();
+        update_option('bcc_disputes_schema_version', BCC_DISPUTES_VERSION, false);
+    }
+}, 5);
 
 add_action('plugins_loaded', function () {
     if (is_admin()) {
@@ -104,9 +159,12 @@ add_action('wp_enqueue_scripts', function () {
     wp_enqueue_style('bcc-disputes', BCC_DISPUTES_URL . 'assets/css/bcc-disputes.css', [], BCC_DISPUTES_VERSION);
     wp_enqueue_script('bcc-disputes', BCC_DISPUTES_URL . 'assets/js/bcc-disputes.js', [], BCC_DISPUTES_VERSION, true);
     wp_localize_script('bcc-disputes', 'bccDisputes', [
-        'restUrl'       => esc_url_raw(rest_url('bcc/v1/disputes')),
-        'reportUserUrl' => esc_url_raw(rest_url('bcc/v1/report-user')),
-        'nonce'         => wp_create_nonce('wp_rest'),
+        'restUrl'         => esc_url_raw(rest_url('bcc/v1/disputes')),
+        'reportUserUrl'   => esc_url_raw(rest_url('bcc/v1/report-user')),
+        'nonce'           => wp_create_nonce('wp_rest'),
+        'minReasonLength' => BCC_DISPUTES_MIN_REASON_LENGTH,
+        'maxReasonLength' => BCC_DISPUTES_MAX_REASON_LENGTH,
+        'minDetailLength' => BCC_DISPUTES_MIN_DETAIL_LENGTH,
     ]);
 });
 

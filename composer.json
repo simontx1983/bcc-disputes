@@ -12,6 +12,11 @@
         "php": ">=7.4"
     },
     "config": {
-        "optimize-autoloader": true
+        "optimize-autoloader": true,
+        "sort-packages": true
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.0",
+        "szepeviktor/phpstan-wordpress": "^2.0"
     }
 }

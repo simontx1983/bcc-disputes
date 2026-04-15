@@ -75,9 +75,17 @@ class DisputeScheduler
      */
     public static function auto_resolve_expired(): void
     {
-        // Advisory lock prevents overlapping cron runs from processing
-        // the same expired disputes concurrently.
+        // Double-lock: transient guard (cross-process) + advisory lock (per-connection).
+        // The transient prevents overlapping cron runs on separate PHP processes;
+        // the advisory lock provides MySQL-level serialization within a connection.
+        $lockKey = 'bcc_disputes_cron_lock';
+        if (get_transient($lockKey)) {
+            return; // Another process is already running
+        }
+        set_transient($lockKey, 1, 300); // 5-minute TTL as safety net
+
         if (!DisputeRepository::acquireAutoResolveLock()) {
+            delete_transient($lockKey);
             return;
         }
 
@@ -86,6 +94,7 @@ class DisputeScheduler
             update_option('bcc_disputes_auto_resolve_last_run', time(), false);
         } finally {
             DisputeRepository::releaseAutoResolveLock();
+            delete_transient($lockKey);
         }
     }
 
@@ -285,11 +294,13 @@ class DisputeScheduler
             return; // System cron is working — no warning needed.
         }
 
-        echo '<div class="notice notice-warning"><p>';
-        echo '<strong>BCC Disputes:</strong> ';
-        echo 'DISABLE_WP_CRON is enabled but the dispute auto-resolve cron has not fired in over 48 hours. ';
-        echo 'Please configure a system cron (<code>wp-cron.php</code>) to ensure disputes are auto-resolved and reconciliation runs.';
-        echo '</p></div>';
+        echo wp_kses_post(
+            '<div class="notice notice-warning"><p>'
+            . '<strong>BCC Disputes:</strong> '
+            . 'DISABLE_WP_CRON is enabled but the dispute auto-resolve cron has not fired in over 48 hours. '
+            . 'Please configure a system cron (<code>wp-cron.php</code>) to ensure disputes are auto-resolved and reconciliation runs.'
+            . '</p></div>'
+        );
     }
 
 }

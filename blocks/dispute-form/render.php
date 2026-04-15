@@ -43,8 +43,8 @@ wp_enqueue_script('bcc-disputes');
 
             <label class="bcc-dispute-label">
                 <?php esc_html_e('Reason', 'bcc-disputes'); ?> <span class="bcc-dispute-required">*</span>
-                <textarea class="bcc-dispute-reason" rows="4" minlength="20" maxlength="1000"
-                          placeholder="<?php esc_attr_e('Explain why you believe this vote is invalid (min 20 chars)&hellip;', 'bcc-disputes'); ?>"></textarea>
+                <textarea class="bcc-dispute-reason" rows="4" minlength="<?php echo esc_attr(BCC_DISPUTES_MIN_REASON_LENGTH); ?>" maxlength="<?php echo esc_attr(BCC_DISPUTES_MAX_REASON_LENGTH); ?>"
+                          placeholder="<?php echo esc_attr(sprintf(__('Explain why you believe this vote is invalid (min %d chars)&hellip;', 'bcc-disputes'), BCC_DISPUTES_MIN_REASON_LENGTH)); ?>"></textarea>
             </label>
 
             <label class="bcc-dispute-label">

@@ -30,8 +30,8 @@ class DisputeController
             'permission_callback' => function () { return is_user_logged_in() && Permissions::is_not_suspended(); },
             'args'                => [
                 'vote_id'      => ['required' => true,  'type' => 'integer', 'minimum' => 1],
-                'reason'       => ['required' => true,  'type' => 'string',  'sanitize_callback' => 'sanitize_textarea_field', 'minLength' => 20, 'maxLength' => 1000,
-                                   'validate_callback' => function ($value) { return strlen(trim($value)) >= 20 ? true : new \WP_Error('too_short', 'Reason must be at least 20 non-whitespace characters.'); }],
+                'reason'       => ['required' => true,  'type' => 'string',  'sanitize_callback' => 'sanitize_textarea_field', 'minLength' => BCC_DISPUTES_MIN_REASON_LENGTH, 'maxLength' => BCC_DISPUTES_MAX_REASON_LENGTH,
+                                   'validate_callback' => function ($value) { return strlen(trim($value)) >= BCC_DISPUTES_MIN_REASON_LENGTH ? true : new \WP_Error('too_short', 'Reason must be at least ' . BCC_DISPUTES_MIN_REASON_LENGTH . ' non-whitespace characters.'); }],
                 'evidence_url' => ['required' => false, 'type' => 'string',  'sanitize_callback' => 'esc_url_raw', 'maxLength' => 2083],
             ],
         ]);
@@ -148,9 +148,12 @@ class DisputeController
         $panelists = $this->selectPanelists($current_user_id, $voter_id);
 
         if (count($panelists) < BCC_DISPUTES_PANEL_SIZE) {
+            $found = count($panelists);
             return $this->error('insufficient_panelists',
-                'Cannot create dispute — not enough eligible panelists available. The system requires at least '
-                . BCC_DISPUTES_PANEL_SIZE . ' independent panelists.', 503);
+                "Cannot create dispute — only {$found} of " . BCC_DISPUTES_PANEL_SIZE
+                . ' qualified panelists are available. Panelists must be Trusted or Elite tier members'
+                . ' with clean fraud records. As the community grows, more panelists will become eligible.'
+                . ' Your dispute has NOT been filed — please try again later.', 503);
         }
 
         $result = DisputeRepository::createDisputeWithPanel([
@@ -445,7 +448,32 @@ class DisputeController
         }
 
         $service = ServiceLocator::resolveTrustReadService();
-        return $service->getEligiblePanelistUserIds([$reporter_id, $voter_id], $needed);
+        // Request extra candidates so we can filter out overloaded panelists.
+        $candidates = $service->getEligiblePanelistUserIds(
+            [$reporter_id, $voter_id],
+            $needed * 3
+        );
+
+        if (empty($candidates)) {
+            return [];
+        }
+
+        // Per-panelist load cap: skip panelists already serving on too many
+        // active disputes. Prevents reviewer fatigue and ensures review quality.
+        $maxActivePanels = (int) apply_filters('bcc_disputes_max_active_panels_per_user', 10);
+        $filtered = [];
+
+        foreach ($candidates as $uid) {
+            if (count($filtered) >= $needed) {
+                break;
+            }
+            $activeCount = DisputeRepository::countActivePanelAssignments($uid);
+            if ($activeCount < $maxActivePanels) {
+                $filtered[] = $uid;
+            }
+        }
+
+        return $filtered;
     }
 
     /**
@@ -518,8 +546,8 @@ class DisputeController
             return $this->error('user_not_found', 'User not found.', 404);
         }
 
-        if ( $reason_key === 'other' && strlen( $reason_detail ) < 10 ) {
-            return $this->error('detail_required', 'Please provide at least 10 characters describing your reason.', 400);
+        if ( $reason_key === 'other' && strlen( $reason_detail ) < BCC_DISPUTES_MIN_DETAIL_LENGTH ) {
+            return $this->error('detail_required', 'Please provide at least ' . BCC_DISPUTES_MIN_DETAIL_LENGTH . ' characters describing your reason.', 400);
         }
 
         if ( DisputeRepository::countRecentReportsByReporter($reporter_id) >= 5 ) {

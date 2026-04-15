@@ -12,7 +12,11 @@
             ...opts,
         }).then(async res => {
             const json = await res.json();
-            if (!res.ok) throw new Error(json.message || 'Request failed');
+            if (!res.ok) {
+                const err = new Error(json.message || 'Request failed');
+                err.code = json.code || '';
+                throw err;
+            }
             return json;
         });
     }
@@ -108,8 +112,9 @@
             const btn      = el.querySelector('#bcc-dispute-submit');
 
             if (!selectedVoteId) return;
-            if (reason.length < 20) {
-                statusEl.textContent = 'Reason must be at least 20 characters.';
+            var minLen = (typeof bccDisputes !== 'undefined' && bccDisputes.minReasonLength) ? parseInt(bccDisputes.minReasonLength, 10) : 20;
+            if (reason.length < minLen) {
+                statusEl.textContent = 'Reason must be at least ' + minLen + ' characters.';
                 statusEl.className = 'bcc-dispute-status bcc-dispute-status--err';
                 return;
             }
@@ -129,8 +134,13 @@
                     loadHistory();
                 })
                 .catch(err => {
-                    statusEl.textContent = err.message || 'Submission failed.';
-                    statusEl.className = 'bcc-dispute-status bcc-dispute-status--err';
+                    if (err.code === 'insufficient_panelists') {
+                        statusEl.textContent = err.message;
+                        statusEl.className = 'bcc-dispute-status bcc-dispute-status--info';
+                    } else {
+                        statusEl.textContent = err.message || 'Submission failed.';
+                        statusEl.className = 'bcc-dispute-status bcc-dispute-status--err';
+                    }
                     btn.disabled = false;
                 });
         });
@@ -332,8 +342,9 @@
                 statusEl.className = 'bcc-dispute-status bcc-dispute-status--err';
                 return;
             }
-            if (reasonKey === 'other' && detail.length < 10) {
-                statusEl.textContent = 'Please provide at least 10 characters describing the issue.';
+            var minDetailLen = (typeof bccDisputes !== 'undefined' && bccDisputes.minDetailLength) ? parseInt(bccDisputes.minDetailLength, 10) : 10;
+            if (reasonKey === 'other' && detail.length < minDetailLen) {
+                statusEl.textContent = 'Please provide at least ' + minDetailLen + ' characters describing the issue.';
                 statusEl.className = 'bcc-dispute-status bcc-dispute-status--err';
                 return;
             }

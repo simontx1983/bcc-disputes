@@ -19,8 +19,6 @@ class DisputeRepository
     /** TTL for data that changes less often (individual dispute lookups). */
     private const TTL_WARM = 300;
 
-    // DISPUTE_COLUMNS and PANEL_COLUMNS removed — were defined but never referenced.
-
     /** User reports table columns. */
     private const REPORT_COLUMNS = 'id, reported_id, reporter_id, reason_key, reason_detail, status, created_at, reviewed_at';
 
@@ -128,7 +126,12 @@ class DisputeRepository
     public static function releaseAutoResolveLock(): void
     {
         global $wpdb;
-        $wpdb->query("SELECT RELEASE_LOCK('bcc_disputes_auto_resolve')");
+        $result = $wpdb->query("SELECT RELEASE_LOCK('bcc_disputes_auto_resolve')");
+        if ($result === false && class_exists('\\BCC\\Core\\Log\\Logger')) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] Failed to release auto-resolve lock', [
+                'db_error' => $wpdb->last_error,
+            ]);
+        }
     }
 
     /**
@@ -147,7 +150,12 @@ class DisputeRepository
     public static function releaseReconcileLock(): void
     {
         global $wpdb;
-        $wpdb->query("SELECT RELEASE_LOCK('bcc_disputes_reconcile')");
+        $result = $wpdb->query("SELECT RELEASE_LOCK('bcc_disputes_reconcile')");
+        if ($result === false && class_exists('\\BCC\\Core\\Log\\Logger')) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] Failed to release reconcile lock', [
+                'db_error' => $wpdb->last_error,
+            ]);
+        }
     }
 
     // ── Query methods ────────────────────────────────────────────────────────
@@ -258,6 +266,10 @@ class DisputeRepository
         $dispute_id = $wpdb->insert_id;
 
         if (!$dispute_id) {
+            if ($wpdb->last_error && stripos($wpdb->last_error, 'Duplicate entry') !== false) {
+                $wpdb->query('ROLLBACK');
+                return ['id' => null, 'failed_panelist' => null, 'db_error' => 'already_disputed'];
+            }
             $wpdb->query('ROLLBACK');
             return ['id' => null, 'failed_panelist' => null, 'db_error' => $wpdb->last_error];
         }
@@ -283,6 +295,12 @@ class DisputeRepository
         }
         self::bumpGeneration("reporter_gen:{$disputeData['reporter_id']}");
         wp_cache_delete('dispute_status_counts', self::CACHE_GROUP);
+
+        // Invalidate the "is this vote disputed?" cache so the newly-disputed
+        // vote is immediately recognized (prevents stale "not disputed" reads).
+        if (!empty($disputeData['vote_id'])) {
+            wp_cache_delete("disputed_vote:{$disputeData['vote_id']}", self::CACHE_GROUP);
+        }
 
         return ['id' => $dispute_id, 'failed_panelist' => null, 'db_error' => null];
     }
@@ -594,10 +612,15 @@ class DisputeRepository
             return ['status' => 'error', 'code' => 'already_voted', 'message' => 'You have already voted on this dispute.', 'http' => 409, 'dispute' => null, 'accepts' => 0, 'rejects' => 0];
         }
 
-        // Atomic tally update
-        $col = $decision === 'accept' ? 'panel_accepts' : 'panel_rejects';
+        // Atomic tally update — uses parameterised CASE to avoid
+        // interpolating a column name into the SQL string.
         $tally_ok = $wpdb->query($wpdb->prepare(
-            "UPDATE {$disputeTable} SET {$col} = {$col} + 1 WHERE id = %d",
+            "UPDATE {$disputeTable}
+             SET panel_accepts = panel_accepts + IF(%s = 'accept', 1, 0),
+                 panel_rejects = panel_rejects + IF(%s = 'reject', 1, 0)
+             WHERE id = %d",
+            $decision,
+            $decision,
             $disputeId
         ));
 
@@ -641,7 +664,7 @@ class DisputeRepository
 
         $existing = $wpdb->get_var($wpdb->prepare(
             "SELECT id FROM {$table}
-             WHERE reporter_id = %d AND reported_id = %d AND status = 'open'
+             WHERE reporter_id = %d AND reported_id = %d AND status IN ('open', 'reviewing')
              LIMIT 1",
             $reporterId, $reportedId
         ));
@@ -692,7 +715,8 @@ class DisputeRepository
 
         $hasDupe = (bool) $wpdb->get_var($wpdb->prepare(
             "SELECT id FROM {$table}
-             WHERE reporter_id = %d AND reported_id = %d AND status = 'open'
+             WHERE reporter_id = %d AND reported_id = %d AND status IN ('open', 'reviewing')
+             FOR UPDATE
              LIMIT 1",
             $reporterId, $reportedId
         ));
@@ -809,7 +833,7 @@ class DisputeRepository
         $table = self::disputes_table();
 
         $rows = $wpdb->get_results(
-            "SELECT status, COUNT(*) AS cnt FROM {$table} GROUP BY status"
+            "SELECT status, COUNT(*) AS cnt FROM {$table} GROUP BY status LIMIT 10"
         );
 
         $counts = [];
@@ -901,7 +925,7 @@ class DisputeRepository
         $table = self::user_reports_table();
 
         $rows = $wpdb->get_results(
-            "SELECT status, COUNT(*) AS cnt FROM {$table} GROUP BY status"
+            "SELECT status, COUNT(*) AS cnt FROM {$table} GROUP BY status LIMIT 10"
         );
 
         $counts = [];
@@ -986,9 +1010,6 @@ class DisputeRepository
         ));
     }
 
-    // reportExists() removed — TOCTOU-redundant. updateReportStatus()
-    // handles non-existent and already-resolved reports atomically.
-
     public static function getReportById(int $reportId): ?object
     {
         global $wpdb;
@@ -1068,7 +1089,7 @@ class DisputeRepository
     /**
      * Get expired disputes past the cutoff date, limited batch.
      *
-     * @return object[]  Each with id, panel_accepts, panel_rejects, vote_id, page_id, voter_id, reporter_id.
+     * @return object[]  Each with id, panel_accepts, panel_rejects, panel_size, vote_id, page_id, voter_id, reporter_id.
      */
     public static function getExpiredDisputes(string $cutoff, int $limit = 50): array
     {
@@ -1076,7 +1097,7 @@ class DisputeRepository
         $table = self::disputes_table();
 
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT id, panel_accepts, panel_rejects, vote_id, page_id, voter_id, reporter_id
+            "SELECT id, panel_accepts, panel_rejects, panel_size, vote_id, page_id, voter_id, reporter_id
              FROM {$table}
              WHERE status = 'reviewing'
                AND created_at <= %s
@@ -1106,7 +1127,7 @@ class DisputeRepository
         $wpdb->query('START TRANSACTION');
 
         $result = $wpdb->query($wpdb->prepare(
-            "UPDATE {$table} SET status = %s, resolved_at = %s
+            "UPDATE {$table} SET status = %s, resolved_at = %s, adjudication_status = 'pending'
              WHERE id = %d AND status = 'reviewing'",
             $outcome,
             gmdate('Y-m-d H:i:s'),
@@ -1144,9 +1165,6 @@ class DisputeRepository
         global $wpdb;
         $wpdb->query('ROLLBACK');
     }
-
-    // reopenDispute() removed — dead code. Reconciliation uses
-    // setAdjudicationStatus() + incrementReopenCount() directly.
 
     // ── Adjudication status tracking ──────────────────────────────────────
 
@@ -1220,7 +1238,10 @@ class DisputeRepository
                  GROUP BY dispute_id
              ) pv ON pv.dispute_id = d.id
              WHERE d.status = 'reviewing'
-               AND (d.panel_accepts + d.panel_rejects) >= d.panel_size
+               AND (
+                   d.panel_accepts >= FLOOR(d.panel_size / 2) + 1
+                   OR d.panel_rejects >= FLOOR(d.panel_size / 2) + 1
+               )
                AND pv.last_voted_at < %s
              ORDER BY pv.last_voted_at ASC
              LIMIT %d",
@@ -1287,6 +1308,37 @@ class DisputeRepository
         foreach ($panelistIds as $uid) {
             self::bumpGeneration("panel_q_gen:{$uid}");
         }
+    }
+
+    /**
+     * Count active panel assignments for a user (disputes in 'reviewing' status).
+     * Used to enforce per-panelist load caps.
+     */
+    public static function countActivePanelAssignments(int $userId): int
+    {
+        // Short-lived cache (30s) to avoid N DB queries when selecting
+        // panelists — called once per candidate during dispute creation.
+        $cacheKey = "panel_load:{$userId}";
+        $cached = wp_cache_get($cacheKey, self::CACHE_GROUP);
+        if ($cached !== false) {
+            return (int) $cached;
+        }
+
+        global $wpdb;
+        $panelTable   = self::panel_table();
+        $disputeTable = self::disputes_table();
+
+        $count = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$panelTable} p
+             INNER JOIN {$disputeTable} d ON d.id = p.dispute_id
+             WHERE p.panelist_user_id = %d
+               AND d.status = 'reviewing'
+               AND p.decision IS NULL",
+            $userId
+        ));
+
+        wp_cache_set($cacheKey, $count, self::CACHE_GROUP, 30);
+        return $count;
     }
 
     // ── Reconciliation helpers ──────────────────────────────────────────────
@@ -1402,7 +1454,7 @@ class DisputeRepository
             INDEX idx_reported (reported_id),
             INDEX idx_reporter (reporter_id),
             INDEX idx_status   (status),
-            UNIQUE KEY uq_reporter_reported_reason (reporter_id, reported_id, reason_key)
+            UNIQUE KEY uq_reporter_reported (reporter_id, reported_id)
         ) {$charset};
         ";
 
@@ -1415,6 +1467,54 @@ class DisputeRepository
             if ($statement !== '') {
                 dbDelta($statement);
             }
+        }
+
+        // Post-install migration: add DB-level unique constraint for active disputes.
+        // MySQL doesn't support partial unique indexes, so we use a generated column
+        // that is vote_id when status='reviewing' and NULL otherwise. UNIQUE indexes
+        // in MySQL ignore NULL values, so only one 'reviewing' row per vote_id is allowed.
+        self::migrateActiveDisputeConstraint();
+    }
+
+    /**
+     * Add a generated column + unique index to enforce one active dispute per vote
+     * at the database level. Complements the application-level FOR UPDATE check.
+     *
+     * The generated column `active_vote_lock` is:
+     *   - vote_id when status = 'reviewing'  (enforces uniqueness)
+     *   - NULL    otherwise                   (ignored by UNIQUE index)
+     */
+    private static function migrateActiveDisputeConstraint(): void
+    {
+        global $wpdb;
+
+        $table = self::disputes_table();
+
+        // Check if column already exists (idempotent).
+        $colExists = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'active_vote_lock'",
+            DB_NAME,
+            $table
+        ));
+
+        if ((int) $colExists > 0) {
+            return; // Already migrated.
+        }
+
+        // Add the generated column. IF() returns vote_id for 'reviewing' rows, NULL otherwise.
+        // STORED so it can be indexed. The UNIQUE index ignores NULLs per SQL standard.
+        $wpdb->query(
+            "ALTER TABLE {$table}
+             ADD COLUMN active_vote_lock BIGINT UNSIGNED
+                 GENERATED ALWAYS AS (IF(status = 'reviewing', vote_id, NULL)) STORED,
+             ADD UNIQUE KEY uq_active_vote (active_vote_lock)"
+        );
+
+        if ($wpdb->last_error) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] Failed to add active_vote_lock constraint', [
+                'error' => $wpdb->last_error,
+            ]);
         }
     }
 }

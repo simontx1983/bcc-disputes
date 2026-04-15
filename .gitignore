@@ -1,5 +1,6 @@
 # Dependencies
 /vendor/
+composer.lock
 
 # Claude Code / Ruflo tooling
 .claude/agents/
@@ -14,6 +15,17 @@
 .playwright-mcp/
 agentdb.rvf
 agentdb.rvf.lock
+
+# Shell fragment artifacts (accidental terminal paste)
+# These are 0-byte files created when shell output is accidentally redirected.
+# Match common patterns: PHP variables, SQL fragments, backtick-quoted identifiers.
+$*
+'*
+%*
+`
+[0-9]
+[0-9][0-9]
+[0-9][0-9][0-9]
 
 # OS / IDE
 .DS_Store

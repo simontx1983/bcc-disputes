@@ -32,8 +32,9 @@ final class ResolveDisputeService
         }
 
         if ($txn['race']) {
-            // Already resolved by a concurrent request — safe to skip
-            CoreLogger::error('[bcc-disputes] ' .'resolve_race_skipped', [
+            // Already resolved by a concurrent request — expected under
+            // concurrent panelist voting; not an error condition.
+            CoreLogger::info('[bcc-disputes] resolve_race_skipped', [
                 'dispute_id' => $disputeId,
                 'outcome'    => $outcome,
             ]);
@@ -43,31 +44,25 @@ final class ResolveDisputeService
         // ── Pre-commit gate: verify trust engine is available ────────────
         try {
             $hasRealAdjudicator = ServiceLocator::hasRealService(DisputeAdjudicationInterface::class);
+
+            if (!$hasRealAdjudicator) {
+                DisputeRepository::rollbackTransaction();
+                CoreLogger::error('[bcc-disputes] ' .'trust_adjudication_service_unavailable', [
+                    'dispute_id' => $disputeId,
+                    'outcome'    => $outcome,
+                ]);
+                return false;
+            }
+
+            // adjudication_status='pending' is already set atomically
+            // by beginResolveTransaction() in the same UPDATE statement.
+
+            DisputeRepository::commitTransaction();
         } catch (\Throwable $e) {
             DisputeRepository::rollbackTransaction();
-            CoreLogger::error('[bcc-disputes] ' .'trust_adjudication_check_failed', [
-                'dispute_id' => $disputeId,
-                'outcome'    => $outcome,
-                'error'      => $e->getMessage(),
-            ]);
+            CoreLogger::error("[ResolveDisputeService] Transaction failed for dispute {$disputeId}: " . $e->getMessage());
             return false;
         }
-
-        if (!$hasRealAdjudicator) {
-            DisputeRepository::rollbackTransaction();
-            CoreLogger::error('[bcc-disputes] ' .'trust_adjudication_service_unavailable', [
-                'dispute_id' => $disputeId,
-                'outcome'    => $outcome,
-            ]);
-            return false;
-        }
-
-        // Mark adjudication as pending BEFORE commit. If PHP dies after
-        // commit but before adjudication, the reconciliation cron will
-        // find this dispute via adjudication_status='pending'.
-        DisputeRepository::setAdjudicationStatus($disputeId, 'pending');
-
-        DisputeRepository::commitTransaction();
 
         // Status changed — invalidate all caches tied to this dispute.
         DisputeRepository::invalidateDispute($disputeId);
