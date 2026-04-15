@@ -6,7 +6,7 @@
     "title": "Dispute Form",
     "category": "bcc-disputes",
     "icon": "clipboard",
-    "description": "Dispute management panel for page owners. Lists votes and allows challenging them via a panel of Gold & Platinum members.",
+    "description": "Dispute management panel for page owners. Place on PeepSo profile pages — auto-detects the current page.",
     "keywords": ["dispute", "vote", "challenge", "trust"],
     "textdomain": "bcc-disputes",
     "attributes": {

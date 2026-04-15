@@ -6,7 +6,7 @@
     "title": "Dispute Panel Queue",
     "category": "bcc-disputes",
     "icon": "list-view",
-    "description": "Panelist review queue showing pending disputes assigned to the current Gold or Platinum member.",
+    "description": "Review queue for dispute panelists. Shows assigned disputes awaiting your vote. Works on any page — only visible to eligible panelists.",
     "keywords": ["dispute", "panel", "queue", "review"],
     "textdomain": "bcc-disputes",
     "supports": {

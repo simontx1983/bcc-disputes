@@ -12,6 +12,13 @@ if (!is_user_logged_in()) {
 
 $page_id = !empty($attributes['pageId']) ? (int) $attributes['pageId'] : get_the_ID();
 if (!$page_id) {
+    if (defined('REST_REQUEST') && REST_REQUEST) {
+        echo '<div class="bcc-block-placeholder" style="padding:20px;background:#f0f0f0;border:1px dashed #ccc;color:#666;text-align:center;border-radius:4px;">'
+           . '<strong>Dispute Form</strong><br>'
+           . '<small>Requires a logged-in page owner on their PeepSo profile.</small>'
+           . '</div>';
+        return;
+    }
     return;
 }
 

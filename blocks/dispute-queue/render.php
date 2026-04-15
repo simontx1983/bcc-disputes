@@ -2,6 +2,13 @@
 if (!defined('ABSPATH')) exit;
 
 if (!is_user_logged_in()) {
+    if (defined('REST_REQUEST') && REST_REQUEST) {
+        echo '<div class="bcc-block-placeholder" style="padding:20px;background:#f0f0f0;border:1px dashed #ccc;color:#666;text-align:center;border-radius:4px;">'
+           . '<strong>Panelist Dispute Queue</strong><br>'
+           . '<small>Visible to eligible panelists when logged in.</small>'
+           . '</div>';
+        return;
+    }
     return;
 }
 

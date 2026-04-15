@@ -6,7 +6,7 @@
     "title": "Report User Button",
     "category": "bcc-disputes",
     "icon": "flag",
-    "description": "Renders a Report User button for a specified user. Hidden if the viewer is not logged in or is the same user.",
+    "description": "Report user button. Place on PeepSo profile pages — hidden on your own profile. Auto-detects the profile owner.",
     "keywords": ["report", "user", "flag", "moderation"],
     "textdomain": "bcc-disputes",
     "attributes": {
