@@ -38,8 +38,10 @@ class DisputeScheduler
         add_action(self::EVENT_RECONCILE, [__CLASS__, 'reconcileOrphanedDisputes']);
         add_action('bcc_disputes_async_resolve', [__CLASS__, 'handleAsyncResolve'], 10, 6);
 
-        // Admin health check: warn if WP-Cron is disabled without a system cron.
+        // Admin health checks.
         add_action('admin_notices', [__CLASS__, 'warnIfCronDisabled']);
+        add_action('admin_notices', [__CLASS__, 'warnIfAdjudicationDown']);
+        add_action('admin_notices', [__CLASS__, 'warnIfPermanentOrphans']);
 
         // Register the 5-minute cron interval if not already available.
         add_filter('cron_schedules', function (array $schedules): array {
@@ -75,17 +77,16 @@ class DisputeScheduler
      */
     public static function auto_resolve_expired(): void
     {
-        // Double-lock: transient guard (cross-process) + advisory lock (per-connection).
-        // The transient prevents overlapping cron runs on separate PHP processes;
-        // the advisory lock provides MySQL-level serialization within a connection.
-        $lockKey = 'bcc_disputes_cron_lock';
-        if (get_transient($lockKey)) {
-            return; // Another process is already running
-        }
-        set_transient($lockKey, 1, 300); // 5-minute TTL as safety net
-
+        // Single atomic lock: MySQL advisory lock serialises across all PHP
+        // processes on the same DB.  GET_LOCK(name, 0) is non-blocking — if
+        // another process holds it we return immediately.
+        //
+        // The previous transient-based "outer lock" had a TOCTOU race: two
+        // processes could both read the transient as empty, both set it, and
+        // both proceed.  Worse, the losing process deleted the transient on
+        // advisory-lock failure, opening a window for a third process.
+        // The advisory lock alone is sufficient and race-free.
         if (!DisputeRepository::acquireAutoResolveLock()) {
-            delete_transient($lockKey);
             return;
         }
 
@@ -94,7 +95,6 @@ class DisputeScheduler
             update_option('bcc_disputes_auto_resolve_last_run', time(), false);
         } finally {
             DisputeRepository::releaseAutoResolveLock();
-            delete_transient($lockKey);
         }
     }
 
@@ -166,6 +166,9 @@ class DisputeScheduler
         // These are invisible to the orphan query (which only looks for
         // accepted/rejected status), so they'd wait 7 days for auto-resolve.
         self::retryStuckReviewingDisputes();
+
+        // PHASE A.5: Alert admins if adjudication has been unavailable for >1 hour.
+        self::checkAdjudicationHealth();
 
         // PHASE B: Retry orphaned adjudications (committed but never completed).
         $orphans = DisputeRepository::getOrphanedDisputes(10);
@@ -274,6 +277,120 @@ class DisputeScheduler
     }
 
     /**
+     * Alert admins when the trust adjudication service has been unavailable
+     * for over 1 hour.  Detected by checking for disputes resolved >1 hour
+     * ago whose adjudication_status is still 'pending' or 'failed'.
+     *
+     * Sets a transient that triggers an admin notice on the next dashboard
+     * load.  The transient auto-expires after 2 hours to self-clear once
+     * the service recovers and reconciliation catches up.
+     */
+    private static function checkAdjudicationHealth(): void
+    {
+        $staleCount = DisputeRepository::countStaleAdjudications();
+
+        if ($staleCount === 0) {
+            delete_transient('bcc_disputes_adjudication_alert');
+            return;
+        }
+
+        // Only log + set transient if not already alerting (avoid log spam).
+        if (!get_transient('bcc_disputes_adjudication_alert')) {
+            CoreLogger::error('[bcc-disputes] adjudication_unavailable_prolonged', [
+                'stale_count' => $staleCount,
+                'threshold'   => '1 hour',
+            ]);
+            set_transient('bcc_disputes_adjudication_alert', $staleCount, 2 * HOUR_IN_SECONDS);
+        }
+    }
+
+    /**
+     * Show admin notice when adjudication has been unavailable for >1 hour.
+     * Companion to checkAdjudicationHealth() (called from reconciliation cron).
+     */
+    public static function warnIfAdjudicationDown(): void
+    {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        $staleCount = get_transient('bcc_disputes_adjudication_alert');
+        if (!$staleCount) {
+            return;
+        }
+
+        echo wp_kses_post(
+            '<div class="notice notice-error"><p>'
+            . '<strong>BCC Disputes:</strong> '
+            . sprintf(
+                '%d dispute(s) have been waiting over 1 hour for trust adjudication. '
+                . 'The trust engine adjudication service may be unavailable. '
+                . 'Check the <code>bcc-trust-engine</code> plugin status.',
+                (int) $staleCount
+            )
+            . '</p></div>'
+        );
+    }
+
+    /**
+     * Emergency fallback: resolve severely overdue disputes on-demand.
+     *
+     * Called from DisputeController when a panelist or reporter loads
+     * their queue. If cron has stopped (misconfigured, disabled, hosting
+     * issue), disputes can sit in 'reviewing' indefinitely. This catches
+     * disputes that are 2x the TTL (14 days) overdue and resolves up to
+     * 5 per request to avoid blocking the HTTP response.
+     *
+     * This is a SAFETY NET, not a replacement for cron. It only fires
+     * when cron has clearly failed.
+     */
+    public static function emergencyResolveIfStale(): void
+    {
+        // Only trigger if auto-resolve hasn't run in 48+ hours.
+        $lastRun = (int) get_option('bcc_disputes_auto_resolve_last_run', 0);
+        if ($lastRun > 0 && (time() - $lastRun) < 2 * DAY_IN_SECONDS) {
+            return; // Cron is working — no emergency needed.
+        }
+
+        // Rate-limit the emergency check to once per 10 minutes per process.
+        $emergencyKey = 'bcc_disputes_emergency_check';
+        if (get_transient($emergencyKey)) {
+            return;
+        }
+        set_transient($emergencyKey, 1, 600);
+
+        $hardStopCutoff = gmdate('Y-m-d H:i:s', time() - (BCC_DISPUTES_TTL_DAYS * 2 * DAY_IN_SECONDS));
+        $stale = DisputeRepository::getExpiredDisputes($hardStopCutoff, 5);
+
+        if (empty($stale)) {
+            return;
+        }
+
+        CoreLogger::warning('[bcc-disputes] emergency_resolve_triggered', [
+            'count'       => count($stale),
+            'last_cron'   => $lastRun > 0 ? gmdate('Y-m-d H:i:s', $lastRun) : 'never',
+            'hard_cutoff' => $hardStopCutoff,
+        ]);
+
+        foreach ($stale as $dispute) {
+            $verdict = DisputeRepository::computeVerdict(
+                (int) $dispute->panel_accepts,
+                (int) $dispute->panel_rejects,
+                (int) $dispute->panel_size
+            );
+
+            DisputeNotificationService::enqueueAsync('bcc_disputes_async_resolve', [
+                (int) $dispute->id,
+                (int) $dispute->vote_id,
+                (int) $dispute->page_id,
+                (int) $dispute->voter_id,
+                (int) $dispute->reporter_id,
+                $verdict['outcome'],
+            ]);
+        }
+    }
+
+    /**
      * Show an admin notice if WP-Cron is disabled and the auto-resolve
      * cron hasn't fired recently. Without a system cron replacement,
      * disputes will never auto-resolve and reconciliation won't run.
@@ -299,6 +416,42 @@ class DisputeScheduler
             . '<strong>BCC Disputes:</strong> '
             . 'DISABLE_WP_CRON is enabled but the dispute auto-resolve cron has not fired in over 48 hours. '
             . 'Please configure a system cron (<code>wp-cron.php</code>) to ensure disputes are auto-resolved and reconciliation runs.'
+            . '</p></div>'
+        );
+    }
+
+    /**
+     * Show admin notice when disputes have exhausted all reconciliation
+     * retries and require manual admin intervention.
+     */
+    public static function warnIfPermanentOrphans(): void
+    {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        // Cache the count check for 30 minutes to avoid extra queries on every admin page.
+        $cacheKey = 'bcc_disputes_permanent_orphan_count';
+        $count = get_transient($cacheKey);
+        if ($count === false) {
+            $count = DisputeRepository::countPermanentOrphans();
+            set_transient($cacheKey, $count, 30 * MINUTE_IN_SECONDS);
+        }
+
+        if ((int) $count === 0) {
+            return;
+        }
+
+        echo wp_kses_post(
+            '<div class="notice notice-error"><p>'
+            . '<strong>BCC Disputes:</strong> '
+            . sprintf(
+                '%d dispute(s) have failed adjudication 3+ times and are permanently stuck. '
+                . 'Trust scores for these disputes are NOT applied. '
+                . '<a href="%s">Review and re-adjudicate &rarr;</a>',
+                (int) $count,
+                admin_url('admin.php?page=bcc-trust-dashboard&tab=disputes&filter=orphaned')
+            )
             . '</p></div>'
         );
     }

@@ -124,6 +124,32 @@ add_action('init', function () {
     \BCC\Disputes\Services\DisputeNotificationService::registerAsyncHandlers();
 });
 
+// ── User deletion: clean up disputes, panel assignments, and reports ────────
+add_action('delete_user', function (int $userId): void {
+    global $wpdb;
+    $disputes = \BCC\Disputes\Repositories\DisputeRepository::disputes_table();
+    $panel    = \BCC\Disputes\Repositories\DisputeRepository::panel_table();
+    $reports  = \BCC\Disputes\Repositories\DisputeRepository::user_reports_table();
+
+    // Remove panel assignments for this user (they can no longer vote).
+    // Active disputes with reduced panels still auto-resolve via TTL.
+    $wpdb->delete($panel, ['panelist_user_id' => $userId], ['%d']);
+
+    // Close any open disputes filed BY this user (reporter leaving).
+    $wpdb->query($wpdb->prepare(
+        "UPDATE {$disputes} SET status = 'dismissed', resolved_at = UTC_TIMESTAMP()
+         WHERE reporter_id = %d AND status = 'reviewing'",
+        $userId
+    ));
+
+    // Close reports filed by or against this user.
+    $wpdb->query($wpdb->prepare(
+        "UPDATE {$reports} SET status = 'dismissed', reviewed_at = UTC_TIMESTAMP()
+         WHERE (reporter_id = %d OR reported_id = %d) AND status = 'open'",
+        $userId, $userId
+    ));
+}, 10, 1);
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 add_action('rest_api_init', function () {
     (new \BCC\Disputes\Controllers\DisputeController())->register_routes();

@@ -158,6 +158,27 @@ class DisputeRepository
         }
     }
 
+    // ── Health-check queries ────────────────────────────────────────────────
+
+    /**
+     * Count disputes that resolved >1 hour ago but still have pending/failed
+     * adjudication.  Used by DisputeScheduler::checkAdjudicationHealth() to
+     * detect prolonged trust-engine unavailability.
+     */
+    public static function countStaleAdjudications(): int
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        return (int) $wpdb->get_var(
+            "SELECT COUNT(*)
+             FROM {$table}
+             WHERE status IN ('accepted', 'rejected')
+               AND adjudication_status IN ('pending', 'failed')
+               AND resolved_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR)"
+        );
+    }
+
     // ── Query methods ────────────────────────────────────────────────────────
 
     /**
@@ -1094,14 +1115,29 @@ class DisputeRepository
     public static function getExpiredDisputes(string $cutoff, int $limit = 50): array
     {
         global $wpdb;
-        $table = self::disputes_table();
+        $table      = self::disputes_table();
+        $panelTable = self::panel_table();
 
+        // Derive tallies from panel rows instead of trusting the denormalised
+        // panel_accepts / panel_rejects columns.  If the counts diverge (admin
+        // edit, partial-failure on a future code path), the verdict is still
+        // computed from the authoritative panel decisions.
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT id, panel_accepts, panel_rejects, panel_size, vote_id, page_id, voter_id, reporter_id
-             FROM {$table}
-             WHERE status = 'reviewing'
-               AND created_at <= %s
-             ORDER BY created_at ASC
+            "SELECT d.id, d.panel_size, d.vote_id, d.page_id, d.voter_id, d.reporter_id,
+                    COALESCE(pt.accepts, 0) AS panel_accepts,
+                    COALESCE(pt.rejects, 0) AS panel_rejects
+             FROM {$table} d
+             LEFT JOIN (
+                 SELECT dispute_id,
+                        SUM(decision = 'accept') AS accepts,
+                        SUM(decision = 'reject') AS rejects
+                 FROM {$panelTable}
+                 WHERE decision IS NOT NULL
+                 GROUP BY dispute_id
+             ) pt ON pt.dispute_id = d.id
+             WHERE d.status = 'reviewing'
+               AND d.created_at <= %s
+             ORDER BY d.created_at ASC
              LIMIT %d",
             $cutoff, $limit
         ));
@@ -1220,27 +1256,32 @@ class DisputeRepository
     public static function getStuckReviewingDisputes(string $cutoff, int $limit = 10): array
     {
         global $wpdb;
-        $table = self::disputes_table();
-
+        $table      = self::disputes_table();
         $panelTable = self::panel_table();
 
-        // Use the latest panel vote timestamp (not dispute created_at)
-        // to avoid re-triggering resolution on old disputes where the
-        // deciding vote just came in seconds ago.
+        // Derive tallies from panel rows (authoritative) instead of the
+        // denormalised dispute columns.  Also uses the latest panel vote
+        // timestamp to avoid re-triggering on disputes where the deciding
+        // vote just came in seconds ago.
         return $wpdb->get_results($wpdb->prepare(
             "SELECT d.id, d.vote_id, d.page_id, d.voter_id, d.reporter_id,
-                    d.panel_accepts, d.panel_rejects, d.panel_size
+                    d.panel_size,
+                    COALESCE(pv.accepts, 0) AS panel_accepts,
+                    COALESCE(pv.rejects, 0) AS panel_rejects
              FROM {$table} d
              INNER JOIN (
-                 SELECT dispute_id, MAX(voted_at) AS last_voted_at
+                 SELECT dispute_id,
+                        MAX(voted_at) AS last_voted_at,
+                        SUM(decision = 'accept') AS accepts,
+                        SUM(decision = 'reject') AS rejects
                  FROM {$panelTable}
                  WHERE decision IS NOT NULL
                  GROUP BY dispute_id
              ) pv ON pv.dispute_id = d.id
              WHERE d.status = 'reviewing'
                AND (
-                   d.panel_accepts >= FLOOR(d.panel_size / 2) + 1
-                   OR d.panel_rejects >= FLOOR(d.panel_size / 2) + 1
+                   pv.accepts >= FLOOR(d.panel_size / 2) + 1
+                   OR pv.rejects >= FLOOR(d.panel_size / 2) + 1
                )
                AND pv.last_voted_at < %s
              ORDER BY pv.last_voted_at ASC
@@ -1266,6 +1307,69 @@ class DisputeRepository
                AND reopen_count < 3
                AND resolved_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 MINUTE)"
         );
+    }
+
+    /**
+     * Count disputes that exhausted all reconciliation retries (reopen_count >= 3)
+     * and will never be automatically retried. These require manual admin intervention.
+     */
+    public static function countPermanentOrphans(): int
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        return (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE status IN ('accepted', 'rejected')
+               AND adjudication_status IN ('pending', 'failed')
+               AND reopen_count >= 3"
+        );
+    }
+
+    /**
+     * Get permanently orphaned disputes for admin review.
+     *
+     * @return list<object>
+     */
+    public static function getPermanentOrphans(int $limit = 20): array
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT id, vote_id, page_id, reporter_id, voter_id, status,
+                    adjudication_status, reopen_count, resolved_at
+             FROM {$table}
+             WHERE status IN ('accepted', 'rejected')
+               AND adjudication_status IN ('pending', 'failed')
+               AND reopen_count >= 3
+             ORDER BY resolved_at ASC
+             LIMIT %d",
+            $limit
+        )) ?: [];
+    }
+
+    /**
+     * Reset reopen_count for a dispute, allowing reconciliation to retry.
+     * Used by admin "force re-adjudicate" action.
+     */
+    public static function resetReopenCount(int $disputeId): bool
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+
+        $affected = $wpdb->query($wpdb->prepare(
+            "UPDATE {$table}
+             SET reopen_count = 0, adjudication_status = 'pending'
+             WHERE id = %d AND reopen_count >= 3",
+            $disputeId
+        ));
+
+        if ($affected > 0) {
+            self::invalidateDispute($disputeId);
+        }
+
+        return $affected > 0;
     }
 
     // ── Cache invalidation ─────────────────────────────────────────────────
@@ -1308,6 +1412,46 @@ class DisputeRepository
         foreach ($panelistIds as $uid) {
             self::bumpGeneration("panel_q_gen:{$uid}");
         }
+    }
+
+    /**
+     * Batch-count active panel assignments for multiple users in a single query.
+     *
+     * Returns an associative array of user_id => active_count. Users with zero
+     * active assignments are included with count 0.
+     *
+     * @param int[] $userIds
+     * @return array<int, int>
+     */
+    public static function batchCountActivePanelAssignments(array $userIds): array
+    {
+        if (empty($userIds)) {
+            return [];
+        }
+
+        $result = array_fill_keys($userIds, 0);
+
+        global $wpdb;
+        $panelTable   = self::panel_table();
+        $disputeTable = self::disputes_table();
+
+        $placeholders = implode(',', array_fill(0, count($userIds), '%d'));
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT p.panelist_user_id, COUNT(*) AS active_count
+             FROM {$panelTable} p
+             INNER JOIN {$disputeTable} d ON d.id = p.dispute_id
+             WHERE p.panelist_user_id IN ({$placeholders})
+               AND d.status = 'reviewing'
+               AND p.decision IS NULL
+             GROUP BY p.panelist_user_id",
+            ...$userIds
+        ));
+
+        foreach ($rows as $row) {
+            $result[(int) $row->panelist_user_id] = (int) $row->active_count;
+        }
+
+        return $result;
     }
 
     /**
@@ -1415,6 +1559,7 @@ class DisputeRepository
             INDEX idx_vote   (vote_id),
             INDEX idx_status (status),
             INDEX idx_reporter (reporter_id),
+            INDEX idx_reporter_created (reporter_id, created_at),
             INDEX idx_status_created (status, created_at),
             INDEX idx_adjudication (adjudication_status),
             INDEX idx_reconcile (status, adjudication_status, resolved_at)
@@ -1433,6 +1578,7 @@ class DisputeRepository
             UNIQUE KEY uq_panelist_dispute (dispute_id, panelist_user_id),
             INDEX idx_dispute   (dispute_id),
             INDEX idx_panelist  (panelist_user_id),
+            INDEX idx_panelist_decision (panelist_user_id, decision),
             INDEX idx_undecided (decision)
         ) {$charset};
         ";

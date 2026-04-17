@@ -9,6 +9,7 @@ use BCC\Core\ServiceLocator;
 use BCC\Disputes\Services\ResolveDisputeService;
 use BCC\Disputes\Repositories\DisputeRepository;
 use BCC\Disputes\Services\DisputeNotificationService;
+use BCC\Disputes\Services\DisputeScheduler;
 use WP_REST_Request;
 use WP_REST_Response;
 use WP_REST_Server;
@@ -278,6 +279,10 @@ class DisputeController
 
     public function panel_queue(WP_REST_Request $req): WP_REST_Response
     {
+        // Safety net: if cron has stopped, resolve severely overdue disputes
+        // on-demand so panelists aren't stuck with stale queues forever.
+        DisputeScheduler::emergencyResolveIfStale();
+
         $userId   = get_current_user_id();
         $page     = max(1, (int) $req->get_param('page'));
         $per_page = min(100, max(1, (int) ($req->get_param('per_page') ?: 20)));
@@ -460,15 +465,17 @@ class DisputeController
 
         // Per-panelist load cap: skip panelists already serving on too many
         // active disputes. Prevents reviewer fatigue and ensures review quality.
+        // Uses a batch query to avoid N+1 (one query per candidate).
         $maxActivePanels = (int) apply_filters('bcc_disputes_max_active_panels_per_user', 10);
-        $filtered = [];
 
+        $loadMap = DisputeRepository::batchCountActivePanelAssignments($candidates);
+
+        $filtered = [];
         foreach ($candidates as $uid) {
             if (count($filtered) >= $needed) {
                 break;
             }
-            $activeCount = DisputeRepository::countActivePanelAssignments($uid);
-            if ($activeCount < $maxActivePanels) {
+            if (($loadMap[$uid] ?? 0) < $maxActivePanels) {
                 $filtered[] = $uid;
             }
         }
