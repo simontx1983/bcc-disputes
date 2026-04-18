@@ -273,6 +273,41 @@ class DisputeRepository
             }
         }
 
+        // Re-verify panelist load counts inside the transaction with FOR UPDATE
+        // to prevent TOCTOU race where selectPanelists() ran outside the transaction.
+        // This ensures load caps cannot be bypassed by concurrent dispute creation.
+        $maxActivePanels = (int) apply_filters('bcc_disputes_max_active_panels_per_user', 10);
+        if (!empty($panelistIds)) {
+            $panelistPlaceholders = implode(',', array_fill(0, count($panelistIds), '%d'));
+            $loadRows = $wpdb->get_results($wpdb->prepare(
+                "SELECT p.panelist_user_id, COUNT(*) AS active_count
+                 FROM {$panelTable} p
+                 INNER JOIN {$disputeTable} d ON d.id = p.dispute_id
+                 WHERE p.panelist_user_id IN ({$panelistPlaceholders})
+                   AND d.status = 'reviewing'
+                   AND p.decision IS NULL
+                 GROUP BY p.panelist_user_id
+                 FOR UPDATE",
+                ...$panelistIds
+            ));
+
+            $loadMap = [];
+            foreach ($loadRows as $row) {
+                $loadMap[(int) $row->panelist_user_id] = (int) $row->active_count;
+            }
+
+            // Filter out any panelists that have exceeded their load cap
+            // since the pre-transaction check.
+            $panelistIds = array_values(array_filter($panelistIds, function (int $uid) use ($loadMap, $maxActivePanels) {
+                return ($loadMap[$uid] ?? 0) < $maxActivePanels;
+            }));
+
+            if (count($panelistIds) < BCC_DISPUTES_PANEL_SIZE) {
+                $wpdb->query('ROLLBACK');
+                return ['id' => null, 'failed_panelist' => null, 'db_error' => 'insufficient_panelists'];
+            }
+        }
+
         $wpdb->insert($disputeTable, [
             'vote_id'      => $disputeData['vote_id'],
             'page_id'      => $disputeData['page_id'],
@@ -1219,6 +1254,44 @@ class DisputeRepository
             $status,
             $disputeId
         ));
+        // Invalidate cached dispute so subsequent reads see the new status.
+        self::invalidateDispute($disputeId);
+
+        /**
+         * Fires when a dispute's adjudication status changes.
+         *
+         * Cross-plugin consumers can hook here to react to dispute
+         * lifecycle events (e.g. clearing derived caches, updating
+         * admin dashboards, sending notifications).
+         *
+         * @param int    $disputeId  The dispute that changed.
+         * @param string $status     New status: 'pending', 'completed', or 'failed'.
+         */
+        do_action('bcc_dispute_status_changed', $disputeId, $status);
+    }
+
+    /**
+     * Read the adjudication_status directly from DB, bypassing cache.
+     *
+     * Use this when you need post-write consistency — e.g. verifying
+     * that a setAdjudicationStatus() write actually persisted before
+     * firing irreversible side-effects.
+     *
+     * getDisputeById() must NOT be used for this purpose because:
+     * (1) it returns cached data (stale after recent writes), and
+     * (2) its SELECT does not include the adjudication_status column.
+     *
+     * @param int $disputeId
+     * @return string|null The status, or null if dispute not found.
+     */
+    public static function getAdjudicationStatus(int $disputeId): ?string
+    {
+        global $wpdb;
+        $table = self::disputes_table();
+        return $wpdb->get_var($wpdb->prepare(
+            "SELECT adjudication_status FROM {$table} WHERE id = %d",
+            $disputeId
+        ));
     }
 
     /**
@@ -1600,7 +1673,7 @@ class DisputeRepository
             INDEX idx_reported (reported_id),
             INDEX idx_reporter (reporter_id),
             INDEX idx_status   (status),
-            UNIQUE KEY uq_reporter_reported (reporter_id, reported_id)
+            INDEX idx_reporter_reported (reporter_id, reported_id)
         ) {$charset};
         ";
 

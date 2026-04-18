@@ -206,7 +206,25 @@ class DisputeScheduler
             }
 
             if ($success) {
+                // Write status BEFORE firing side-effects. If this fails,
+                // the dispute stays 'failed' and the next reconcile tick
+                // retries — but the penalty hook will NOT have fired yet,
+                // preventing double-penalty on retry.
                 DisputeRepository::setAdjudicationStatus($disputeId, 'completed');
+
+                // Verify the status write actually took effect before
+                // firing irreversible side-effects (penalty hook, emails).
+                // Uses the dedicated uncached repository method — NOT
+                // getDisputeById() which is cached and omits this column.
+                $adjStatus = DisputeRepository::getAdjudicationStatus($disputeId);
+                if ($adjStatus !== 'completed') {
+                    CoreLogger::error('[bcc-disputes] reconcile_status_write_failed', [
+                        'dispute_id' => $disputeId,
+                        'actual_status' => $adjStatus,
+                    ]);
+                    // Do NOT fire penalty or notification — next tick will retry.
+                    continue;
+                }
 
                 // Fire penalty hook if dispute was rejected.
                 if ($dispute->status === 'rejected') {
@@ -352,7 +370,8 @@ class DisputeScheduler
             return; // Cron is working — no emergency needed.
         }
 
-        // Rate-limit the emergency check to once per 10 minutes per process.
+        // Rate-limit the emergency check per-process, scoped per-dispute batch
+        // via a global transient. Individual disputes are de-duped below.
         $emergencyKey = 'bcc_disputes_emergency_check';
         if (get_transient($emergencyKey)) {
             return;
@@ -373,6 +392,32 @@ class DisputeScheduler
         ]);
 
         foreach ($stale as $dispute) {
+            $disputeId = (int) $dispute->id;
+
+            // Skip if an async resolve job is already pending for this dispute.
+            // Check Action Scheduler first, then fall back to WP-Cron.
+            $alreadyScheduled = false;
+            if (function_exists('as_next_scheduled_action')) {
+                $alreadyScheduled = (bool) as_next_scheduled_action(
+                    'bcc_disputes_async_resolve',
+                    [$disputeId],
+                    'bcc-disputes'
+                );
+            }
+            if (!$alreadyScheduled) {
+                $alreadyScheduled = (bool) wp_next_scheduled(
+                    'bcc_disputes_async_resolve',
+                    [$disputeId]
+                );
+            }
+
+            if ($alreadyScheduled) {
+                CoreLogger::info('[bcc-disputes] emergency_resolve_skipped_already_queued', [
+                    'dispute_id' => $disputeId,
+                ]);
+                continue;
+            }
+
             $verdict = DisputeRepository::computeVerdict(
                 (int) $dispute->panel_accepts,
                 (int) $dispute->panel_rejects,
@@ -380,7 +425,7 @@ class DisputeScheduler
             );
 
             DisputeNotificationService::enqueueAsync('bcc_disputes_async_resolve', [
-                (int) $dispute->id,
+                $disputeId,
                 (int) $dispute->vote_id,
                 (int) $dispute->page_id,
                 (int) $dispute->voter_id,

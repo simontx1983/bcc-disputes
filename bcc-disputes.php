@@ -131,23 +131,56 @@ add_action('delete_user', function (int $userId): void {
     $panel    = \BCC\Disputes\Repositories\DisputeRepository::panel_table();
     $reports  = \BCC\Disputes\Repositories\DisputeRepository::user_reports_table();
 
-    // Remove panel assignments for this user (they can no longer vote).
-    // Active disputes with reduced panels still auto-resolve via TTL.
-    $wpdb->delete($panel, ['panelist_user_id' => $userId], ['%d']);
-
-    // Close any open disputes filed BY this user (reporter leaving).
-    $wpdb->query($wpdb->prepare(
-        "UPDATE {$disputes} SET status = 'dismissed', resolved_at = UTC_TIMESTAMP()
-         WHERE reporter_id = %d AND status = 'reviewing'",
+    // Collect affected dispute IDs BEFORE modifying rows, so we can
+    // invalidate caches after the transaction commits.
+    $affectedDisputeIds = $wpdb->get_col($wpdb->prepare(
+        "SELECT DISTINCT dispute_id FROM {$panel} WHERE panelist_user_id = %d",
         $userId
     ));
-
-    // Close reports filed by or against this user.
-    $wpdb->query($wpdb->prepare(
-        "UPDATE {$reports} SET status = 'dismissed', reviewed_at = UTC_TIMESTAMP()
-         WHERE (reporter_id = %d OR reported_id = %d) AND status = 'open'",
-        $userId, $userId
+    $reporterDisputeIds = $wpdb->get_col($wpdb->prepare(
+        "SELECT id FROM {$disputes} WHERE reporter_id = %d AND status = 'reviewing'",
+        $userId
     ));
+    $affectedDisputeIds = array_unique(array_merge($affectedDisputeIds, $reporterDisputeIds));
+
+    try {
+        $wpdb->query('START TRANSACTION');
+
+        // Remove panel assignments for this user (they can no longer vote).
+        // Active disputes with reduced panels still auto-resolve via TTL.
+        $wpdb->delete($panel, ['panelist_user_id' => $userId], ['%d']);
+
+        // Close any open disputes filed BY this user (reporter leaving).
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$disputes} SET status = 'dismissed', resolved_at = UTC_TIMESTAMP()
+             WHERE reporter_id = %d AND status = 'reviewing'",
+            $userId
+        ));
+
+        // Close reports filed by or against this user.
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$reports} SET status = 'dismissed', reviewed_at = UTC_TIMESTAMP()
+             WHERE (reporter_id = %d OR reported_id = %d) AND status = 'open'",
+            $userId, $userId
+        ));
+
+        $wpdb->query('COMMIT');
+    } catch (\Throwable $e) {
+        $wpdb->query('ROLLBACK');
+        if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+            \BCC\Core\Log\Logger::error('[bcc-disputes] delete_user_cleanup_failed', [
+                'user_id' => $userId,
+                'error'   => $e->getMessage(),
+            ]);
+        }
+        return;
+    }
+
+    // Invalidate caches for all affected disputes after successful commit.
+    foreach ($affectedDisputeIds as $disputeId) {
+        \BCC\Disputes\Repositories\DisputeRepository::invalidateDispute((int) $disputeId);
+    }
+    wp_cache_delete('report_status_counts', 'bcc_disputes');
 }, 10, 1);
 
 // ── Boot ─────────────────────────────────────────────────────────────────────

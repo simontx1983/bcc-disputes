@@ -175,6 +175,10 @@ class DisputeController
             if ($result['db_error'] === 'dispute_limit_reached') {
                 return $this->error('dispute_limit_reached', 'This page has reached its dispute limit. Please try again later.', 429);
             }
+            if ($result['db_error'] === 'insufficient_panelists') {
+                return $this->error('insufficient_panelists',
+                    'Cannot create dispute — panelist load caps were exceeded during submission. Please try again later.', 503);
+            }
             if ($result['db_error'] === 'reporter_limit_reached') {
                 return $this->error('reporter_limit_reached', 'You have too many active disputes. Please wait for existing disputes to resolve.', 429);
             }
@@ -306,7 +310,7 @@ class DisputeController
         $note       = $req->get_param('note') ?? '';
         $userId     = get_current_user_id();
 
-        $throttled = $this->throttle('dispute_vote', $userId, 10);
+        $throttled = $this->throttle('panel_vote', $userId, 10);
         if ($throttled) return $throttled;
 
         if (!in_array($decision, ['accept', 'reject'], true)) {
