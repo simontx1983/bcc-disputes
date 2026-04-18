@@ -112,6 +112,11 @@ check_wpdb_leaks() {
 
     # grep for 'global $wpdb' or '$wpdb->' in forbidden directories
     while IFS=: read -r file line content; do
+        # Skip comments (lines starting with optional whitespace + // or *)
+        if echo "$content" | grep -qE '^\s*(//|\*|#)'; then
+            continue
+        fi
+
         # Normalize path for display
         local rel="${file#$PLUGINS_DIR/}"
 
