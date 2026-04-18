@@ -1,0 +1,15 @@
+includes:
+    - vendor/szepeviktor/phpstan-wordpress/extension.neon
+
+parameters:
+    level: 6
+    paths:
+        - app/
+    scanDirectories:
+        - ../bcc-core/src/
+    bootstrapFiles:
+        - vendor/php-stubs/wordpress-stubs/wordpress-stubs.php
+        - phpstan-bootstrap.php
+    parallel:
+        maximumNumberOfProcesses: 1
+    treatPhpDocTypesAsCertain: false
